@@ -626,13 +626,22 @@ export class ExecutionService {
         model?.provider ?? null, model?.model ?? null, model?.reasoningEffort ?? null,
         task.permission ?? DEFAULT_PERMISSION, isolation,
       ])
-      const previous = trigger === 'scheduled'
-        ? [...task.executions].reverse().find(e => e.trigger === 'scheduled' && e.sessionId !== undefined)
-        : undefined
-      const resumed = previous?.sessionReuseKey === sessionReuseKey && previous.sessionId !== undefined
-        ? await this.deps.agents.resumeScheduled?.(previous.sessionId, createOptions)
-        : undefined
-      handle = resumed ?? await this.deps.agents.create(createOptions)
+      const selectedSessionId = trigger === 'scheduled' ? task.execution.reuseSessionId : undefined
+      if (selectedSessionId !== undefined) {
+        const resumed = await this.deps.agents.resumeScheduled?.(selectedSessionId, createOptions)
+        if (resumed === undefined) throw new Error(`selected session ${selectedSessionId} is unavailable, busy, archived, or incompatible`)
+        handle = resumed
+      } else {
+        // "New session" starts a fresh conversation on the first trigger;
+        // later periodic triggers retain the existing #26 continuity policy.
+        const previous = trigger === 'scheduled'
+          ? [...task.executions].reverse().find(e => e.trigger === 'scheduled' && e.sessionId !== undefined)
+          : undefined
+        const resumed = previous?.sessionReuseKey === sessionReuseKey && previous.sessionId !== undefined
+          ? await this.deps.agents.resumeScheduled?.(previous.sessionId, createOptions)
+          : undefined
+        handle = resumed ?? await this.deps.agents.create(createOptions)
+      }
       sessionId = handle.agent.id
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -675,7 +684,7 @@ export class ExecutionService {
     //     session list shows the task name (a user-sourced title also stops
     //     automatic first-prompt retitling).
     try {
-      this.deps.renameSession?.(sessionId, task.title)
+      if (task.execution.reuseSessionId !== sessionId) this.deps.renameSession?.(sessionId, task.title)
     } catch { /* cosmetic */ }
 
     // 4. Record the session id (execution is really started now).

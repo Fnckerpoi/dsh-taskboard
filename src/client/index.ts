@@ -269,6 +269,10 @@ export function apply(ctx: ClientContextFace): void {
       getWorkspaces: () => ctx.get?.('workspaces') as WorkspacesServiceFace | undefined,
       getUiWorkspace: () => ctx.get?.('uiWorkspace') as UiWorkspaceFace | undefined,
     }))
+    controller.installSessionTitles(() => {
+      const sessions = ctx.get?.('sessions') as SessionsServiceFace | undefined
+      return (sessions?.list.getSnapshot().byId ?? {}) as Record<string, { displayTitle?: string; title?: string }>
+    })
 
     controller.start()
     const disposers: Array<() => void> = []

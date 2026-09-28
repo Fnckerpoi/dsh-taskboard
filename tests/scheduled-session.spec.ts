@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ExecutionService, type AgentsFace, type EventsFace } from '../src/host/execution.ts'
 import { scheduledSessionResumer, type ScheduledSessionDeps } from '../src/host/scheduled-session.ts'
 import { TaskStore } from '../src/host/store.ts'
-import type { TaskRecord } from '../src/shared/protocol.ts'
+import { spawnNextCycle, type TaskRecord } from '../src/shared/protocol.ts'
 import { waitFor } from './wait-for.ts'
 
 const dirs: string[] = []
@@ -78,7 +78,8 @@ async function fixture() {
       await ledger.mutate('task-updated', l => {
         const t = l.tasks.find(x => x.id === task.id)!
         t.status = 'todo'
-        t.execution = { mode: 'scheduled', cron: '* * * * *', periodicCompletion: 'rearm' }
+        t.execution = { mode: 'scheduled', cron: '* * * * *', periodicCompletion: 'rearm',
+          ...(t.execution.reuseSessionId !== undefined ? { reuseSessionId: t.execution.reuseSessionId } : {}) }
         return [t]
       })
     }
@@ -90,6 +91,31 @@ async function fixture() {
 }
 
 describe('scheduled session reuse', () => {
+  it('carries an explicit selection to a periodic successor card', async () => {
+    const f = await fixture()
+    const source = { ...f.task, execution: { ...f.task.execution, reuseSessionId: 'existing-session' } }
+    expect(spawnNextCycle(source, undefined, Date.now()).execution.reuseSessionId).toBe('existing-session')
+  })
+
+  it('uses the selected project session and fails clearly instead of silently replacing it', async () => {
+    const f = await fixture()
+    const existing = await f.create({ sessionId: 'existing-session', meta: { cwd: f.deps.workspaces.get()!.path } })
+    await f.store.mutate('task-updated', ledger => {
+      ledger.tasks[0]!.execution.reuseSessionId = existing.agent.id
+      return [ledger.tasks[0]!]
+    })
+    const first = await f.run()
+    expect(first.sessionId).toBe('existing-session')
+    await f.finish(first.sessionId)
+    const second = await f.run()
+    expect(second.sessionId).toBe('existing-session')
+    await f.finish(second.sessionId)
+    f.archived.add('existing-session')
+    const failure = await f.svc.run(f.task.id, 'scheduled')
+    expect(failure).toMatchObject({ ok: false, error: expect.stringContaining('selected session existing-session is unavailable') })
+    expect(f.create).toHaveBeenCalledTimes(1)
+  })
+
   it('uses one live conversation for repeated triggers, with fresh prompts and separate execution records', async () => {
     const f = await fixture()
     const first = await f.run()

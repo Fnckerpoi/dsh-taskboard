@@ -57,6 +57,8 @@ export type QueueClearResponse = { cleared: number }
  * worktree option shows the mirror badge when it exceeds 1.
  */
 export type WorkspaceView = { id: string; path: string; title: string; sessionCount: number; gitAvailable?: boolean; repoCount?: number }
+/** Sessions currently owned by one project and eligible for explicit reuse. */
+export type ProjectSessionView = { id: string; title?: string }
 
 /** Create-task request body (actor is always the GUI user). */
 export type CreateTaskBody = {
@@ -65,7 +67,7 @@ export type CreateTaskBody = {
   urgency: string
   description?: string
   prompt?: string
-  execution?: { mode?: string; cron?: string; runAt?: string | number; periodicCompletion?: 'rearm' | 'spawn' }
+  execution?: { mode?: string; cron?: string; runAt?: string | number; periodicCompletion?: 'rearm' | 'spawn'; reuseSessionId?: string }
   model?: TaskModel
   /** Code isolation for executions ('worktree' | 'none'); omitted = default. */
   isolation?: string
@@ -87,7 +89,7 @@ export type UpdateTaskBody = {
   blocked?: boolean
   /** Rebind the task to another project (GUI owner surface only). */
   workspaceId?: string
-  execution?: { mode?: string; cron?: string; runAt?: string | number; periodicCompletion?: 'rearm' | 'spawn' }
+  execution?: { mode?: string; cron?: string; runAt?: string | number; periodicCompletion?: 'rearm' | 'spawn'; reuseSessionId?: string }
   model?: TaskModel | null
   /** Change isolation; locked once the task has execution history. */
   isolation?: string

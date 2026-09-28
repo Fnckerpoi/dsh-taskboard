@@ -22,6 +22,7 @@ import type {
   MoveTaskResponse,
   SessionArchiveResult,
   PromptCompletionsResponse,
+  ProjectSessionView,
   RejectTaskBody,
   RunTaskBody,
   SettingsResponse,
@@ -114,6 +115,7 @@ async function uploadImage(file: Blob): Promise<AttachmentUpload> {
 export interface TaskboardClient {
   state(): Promise<StateResponse>
   workspaces(): Promise<WorkspaceView[]>
+  projectSessions(workspaceId: string): Promise<{ sessions: ProjectSessionView[] }>
   create(body: CreateTaskBody): Promise<TaskSummary>
   get(id: string): Promise<TaskRecord>
   update(id: string, body: UpdateTaskBody): Promise<TaskSummary>
@@ -173,6 +175,7 @@ export function createClient(): TaskboardClient {
   return {
     state: () => get<StateResponse>('/dsh-taskboard/state'),
     workspaces: () => get<WorkspaceView[]>('/dsh-taskboard/workspaces'),
+    projectSessions: workspaceId => get<{ sessions: ProjectSessionView[] }>(`/dsh-taskboard/project-sessions?workspaceId=${encodeURIComponent(workspaceId)}`),
     create: body => post('/dsh-taskboard/tasks', body),
     get: id => get<TaskRecord>(`/dsh-taskboard/tasks/${encodeURIComponent(id)}`),
     update: (id, body) => post(`/dsh-taskboard/tasks/${encodeURIComponent(id)}/update`, body),

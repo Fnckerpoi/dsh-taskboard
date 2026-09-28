@@ -458,6 +458,16 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
           })
           return
         }
+        if (pathname === `${ROUTE_PREFIX}/project-sessions`) {
+          const workspaceId = url.searchParams.get('workspaceId') ?? ''
+          if (workspaces.get(workspaceId) === undefined) {
+            const f = fail('not_found', 'unknown workspace')
+            json(res, f.res, f.status)
+            return
+          }
+          json(res, { ok: true, value: { sessions: (workspaces.sessionIds?.(workspaceId) ?? []).map(id => ({ id })) } })
+          return
+        }
         if (pathname === `${ROUTE_PREFIX}/diagnostics`) {
           const ledger = store.snapshot()
           const queue = queueSummary(ledger)
@@ -678,7 +688,10 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
           if (status !== 'backlog' && status !== 'todo') {
             throw new Error('Error: invalid_transition: a new task must start as backlog or todo')
           }
-          const execution = normalizeExecution((body.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown } | undefined) ?? {}, options.now())
+          const execution = normalizeExecution((body.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown } | undefined) ?? {}, options.now())
+          if (execution.reuseSessionId !== undefined && !workspaces.sessionIds?.(workspaceId)?.includes(execution.reuseSessionId)) {
+            throw new Error('Error: invalid_input: selected session is not available in this workspace')
+          }
           const model = body.model === undefined ? undefined : checkModel(body.model, options.modelProviders)
           const isolationRaw = str(body, 'isolation')
           // 0.5.0: an omitted isolation is MATERIALIZED from the board
@@ -774,7 +787,10 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
               }
               if (typeof body.blocked === 'boolean') next.blocked = body.blocked
               // The GUI (task owner surface) may edit model/execution; null clears the model.
-              if (body.execution !== undefined) next.execution = normalizeExecution(body.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown }, options.now())
+              if (body.execution !== undefined) next.execution = normalizeExecution(body.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown }, options.now())
+              if (next.execution.reuseSessionId !== undefined && !workspaces.sessionIds?.(next.workspaceId)?.includes(next.execution.reuseSessionId)) {
+                throw new Error('Error: invalid_input: selected session is not available in this workspace')
+              }
               if (body.model === null) next.model = undefined
               else if (body.model !== undefined) next.model = checkModel(body.model, options.modelProviders)
               // Isolation may change only before the first execution (分支与基线

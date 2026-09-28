@@ -298,6 +298,8 @@ export const DEFAULT_PERIODIC_COMPLETION: PeriodicCompletion = 'spawn'
  */
 export interface ExecutionConfig {
   mode: ExecutionMode
+  /** Explicit existing project session to continue on scheduled runs. Omitted starts with a new session. */
+  reuseSessionId?: string
   /**
    * Five-field cron expression (minute hour day month weekday). Present on
    * PERIODIC scheduled tasks (定期执行): the scheduler refires the task each
@@ -732,7 +734,8 @@ export function spawnNextCycle(source: TaskRecord, prevExecutionId: string | und
     urgency: source.urgency,
     status: 'todo',
     blocked: false,
-    execution: { mode: 'scheduled', cron, nextRunAt: next, periodicCompletion: source.execution.periodicCompletion ?? DEFAULT_PERIODIC_COMPLETION },
+    execution: { mode: 'scheduled', cron, nextRunAt: next, periodicCompletion: source.execution.periodicCompletion ?? DEFAULT_PERIODIC_COMPLETION,
+      ...(source.execution.reuseSessionId !== undefined ? { reuseSessionId: source.execution.reuseSessionId } : {}) },
     ...(source.model !== undefined ? { model: structuredClone(source.model) } : {}),
     ...(source.isolation !== undefined ? { isolation: source.isolation } : {}),
     ...(source.presetId !== undefined ? { presetId: source.presetId } : {}),
@@ -907,7 +910,7 @@ function normalizeRunAt(raw: unknown): number | undefined {
  * @returns the normalized config.
  */
 export function normalizeExecution(
-  raw: { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown },
+  raw: { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown },
   now: number,
   opts?: { allowPastRunAt?: boolean },
 ): ExecutionConfig {
@@ -917,8 +920,14 @@ export function normalizeExecution(
   }
   if (mode === 'claim') {
     if (raw.periodicCompletion !== undefined) throw new Error('execution.periodicCompletion requires a cron schedule')
+    if (raw.reuseSessionId !== undefined) throw new Error('execution.reuseSessionId requires a scheduled task')
     return { mode }
   }
+  if (raw.reuseSessionId !== undefined && (typeof raw.reuseSessionId !== 'string' || raw.reuseSessionId.length === 0
+    || raw.reuseSessionId.length > 256 || raw.reuseSessionId.trim() !== raw.reuseSessionId || /[\x00-\x1f\x7f]/.test(raw.reuseSessionId))) {
+    throw new Error('execution.reuseSessionId must be a valid session id')
+  }
+  const reuseSession = raw.reuseSessionId === undefined ? {} : { reuseSessionId: raw.reuseSessionId as string }
   const runAt = normalizeRunAt(raw.runAt)
   const cron = (raw.cron ?? '').trim()
   if (cron.length > 0 && runAt !== undefined) {
@@ -927,7 +936,7 @@ export function normalizeExecution(
   if (runAt !== undefined) {
     if (raw.periodicCompletion !== undefined) throw new Error('execution.periodicCompletion requires a cron schedule')
     if (!opts?.allowPastRunAt && runAt <= now) throw new Error('execution.runAt must be in the future')
-    return { mode, runAt, nextRunAt: runAt }
+    return { mode, runAt, nextRunAt: runAt, ...reuseSession }
   }
   const match = parseCron(cron)
   if (match === null) throw new Error('execution.cron is not a valid 5-field cron expression')
@@ -937,7 +946,7 @@ export function normalizeExecution(
   if (periodicCompletion !== 'rearm' && periodicCompletion !== 'spawn') {
     throw new Error("execution.periodicCompletion must be 'rearm' or 'spawn'")
   }
-  return { mode, cron, nextRunAt: next, periodicCompletion }
+  return { mode, cron, nextRunAt: next, periodicCompletion, ...reuseSession }
 }
 
 /**
@@ -1258,7 +1267,7 @@ export function validateImportedTask(raw: unknown, now: number): { ok: true; tas
   if (!isValidTaskId(id)) return fail('missing/invalid id (must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$)')
   try {
     const rawExecution = typeof e.execution === 'object' && e.execution !== null
-      ? e.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; queuedRunAt?: unknown; queuedAt?: unknown; dispatchingRunAt?: unknown }
+      ? e.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown; queuedRunAt?: unknown; queuedAt?: unknown; dispatchingRunAt?: unknown }
       : {}
     const execution = normalizeExecution(
       rawExecution,

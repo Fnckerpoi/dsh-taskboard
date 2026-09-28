@@ -186,6 +186,10 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
   const [periodicCompletion, setPeriodicCompletion] = useState<PeriodicCompletion>(
     task?.execution.periodicCompletion ?? prefill?.execution?.periodicCompletion ?? 'spawn',
   )
+  const [reuseSessionId, setReuseSessionId] = useState(task?.execution.reuseSessionId ?? '')
+  const [projectSessions, setProjectSessions] = useState<Array<{ id: string; title?: string }>>([])
+  const [sessionsLoading, setSessionsLoading] = useState(false)
+  const [sessionsError, setSessionsError] = useState(false)
   // One-shot trigger (定时执行): datetime-local string; '' = unset.
   const initRunAt = initExec?.mode === 'scheduled' && initExec.runAt !== undefined ? initExec.runAt : undefined
   const [runAt, setRunAt] = useState(() => {
@@ -244,6 +248,19 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
     void controller.fetchModelCatalog().then(setCatalog).catch(() => setCatalog([]))
   }, [controller])
 
+  useEffect(() => {
+    if (workspaceId === '') return
+    let active = true
+    setSessionsLoading(true)
+    setSessionsError(false)
+    void controller.fetchProjectSessions(workspaceId).then(sessions => {
+      if (active) setProjectSessions(sessions)
+    }).catch(() => {
+      if (active) { setProjectSessions([]); setSessionsError(true) }
+    }).finally(() => { if (active) setSessionsLoading(false) })
+    return () => { active = false }
+  }, [controller, workspaceId])
+
   // Preset roster: query runtime or fallback to host API; pre-select the deployment default in
   // create mode (unless a template pinned one) so executions run with a
   // real tool set out of the box.
@@ -266,11 +283,13 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
   const runAtMs = mode === 'once' && runAt !== '' ? new Date(runAt).getTime() : NaN
   const runAtBad = mode === 'once' && (runAt === '' || Number.isNaN(runAtMs) || runAtMs <= Date.now())
   const valid = title.trim().length > 0 && workspaceId !== '' && !cronBad && !runAtBad
+    && (mode === 'claim' || reuseSessionId === '' || (!sessionsLoading && projectSessions.some(s => s.id === reuseSessionId)))
 
   /** Execution payload for submit: claim | periodic (cron) | one-shot (runAt ISO). */
-  const executionPayload = (): { mode: 'claim' | 'scheduled'; cron?: string; runAt?: string; periodicCompletion?: PeriodicCompletion } => {
-    if (mode === 'periodic') return { mode: 'scheduled', cron: cron.trim(), periodicCompletion }
-    if (mode === 'once') return { mode: 'scheduled', runAt: new Date(runAt).toISOString() }
+  const executionPayload = (): { mode: 'claim' | 'scheduled'; cron?: string; runAt?: string; periodicCompletion?: PeriodicCompletion; reuseSessionId?: string } => {
+    const reuse = reuseSessionId === '' ? {} : { reuseSessionId }
+    if (mode === 'periodic') return { mode: 'scheduled', cron: cron.trim(), periodicCompletion, ...reuse }
+    if (mode === 'once') return { mode: 'scheduled', runAt: new Date(runAt).toISOString(), ...reuse }
     return { mode: 'claim' }
   }
 
@@ -437,7 +456,7 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
 
             <div className="dsh-atb-form-subgrid">
               <Field label={t('form.field.project')} required>
-                <select value={workspaceId} onChange={e => setWorkspaceId(e.target.value)}>
+                <select value={workspaceId} onChange={e => { setWorkspaceId(e.target.value); setReuseSessionId(''); setProjectSessions([]) }}>
                   {state.workspaces.map(ws => <option key={ws.id} value={ws.id}>{ws.title || ws.path}</option>)}
                 </select>
               </Field>
@@ -612,6 +631,20 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
                   </div>
                 </Field>
               </>
+            )}
+
+            {mode !== 'claim' && (
+              <Field label={t('form.field.reuseSession')} full>
+                <select value={reuseSessionId} onChange={e => setReuseSessionId(e.target.value)}>
+                  <option value="">{t('form.session.new')}</option>
+                  {projectSessions.map(session => <option key={session.id} value={session.id}>{session.title ?? session.id}</option>)}
+                </select>
+                {sessionsLoading && <span className="dsh-atb-isolation-note">{t('shared.loading')}</span>}
+                {sessionsError && <span className="dsh-atb-isolation-note">{t('form.session.unavailable')}</span>}
+                {!sessionsLoading && !sessionsError && reuseSessionId !== '' && !projectSessions.some(session => session.id === reuseSessionId) && (
+                  <span className="dsh-atb-isolation-note">{t('form.session.missing')}</span>
+                )}
+              </Field>
             )}
 
             <Field label={t('form.field.isolation')} full>

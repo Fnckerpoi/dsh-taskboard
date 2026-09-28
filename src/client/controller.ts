@@ -127,6 +127,7 @@ export class BoardController {
   /** Newest change-frame revision seen on the SSE stream (S16 refresh chase). */
   private seenRevision: number | undefined
   private sessionJumper: ((sessionId: string) => Promise<SessionJumpResult>) | undefined
+  private sessionTitles: (() => Record<string, { displayTitle?: string; title?: string }>) | undefined
   /** Composer catalog faces, installed formally by the client entry (T13). */
   private readonly catalogFaces: {
     models?: () => Promise<Array<{
@@ -352,6 +353,10 @@ export class BoardController {
     this.sessionJumper = jumper
   }
 
+  installSessionTitles(reader: () => Record<string, { displayTitle?: string; title?: string }>): void {
+    this.sessionTitles = reader
+  }
+
   /** T13: formal installers for the composer catalog faces (was a monkeypatch from the client entry). */
   installModelCatalog(fn: () => Promise<Array<{
     provider: string
@@ -391,6 +396,13 @@ export class BoardController {
   /**
    * Fetch model catalog: prefers installed runtime face, falls back to Taskboard client API (0.5.5).
    */
+  /** Sessions owned by a project, for the scheduled-run session picker. */
+  async fetchProjectSessions(workspaceId: string): Promise<Array<{ id: string; title?: string }>> {
+    const sessions = (await this.client.projectSessions(workspaceId)).sessions
+    const titles = this.sessionTitles?.() ?? {}
+    return sessions.map(session => ({ ...session, title: titles[session.id]?.displayTitle ?? titles[session.id]?.title }))
+  }
+
   async fetchModelCatalog(): Promise<Array<{
     provider: string
     model: string

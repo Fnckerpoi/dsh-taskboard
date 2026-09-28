@@ -167,6 +167,8 @@ export interface WorkspaceFace {
   get(id: string): { id: string; path: string; title: string } | undefined
   /** List all workspaces. */
   list(): Array<{ id: string; path: string; title: string }>
+  /** Unarchived sessions owned by this project, in registry order. */
+  sessionIds?(workspaceId: string): string[] | undefined
   /** Archive one session durably (when supported by runtime workspaceRegistry). */
   archiveSession?(sessionId: string): Promise<void>
 }
@@ -185,6 +187,12 @@ export function workspaceFace(registry: WorkspaceRegistry): WorkspaceFace {
       return ws === undefined ? undefined : { id: ws.id, path: ws.path, title: ws.title }
     },
     list: () => registry.list().map(ws => ({ id: ws.id, path: ws.path, title: ws.title })),
+    sessionIds: id => {
+      const ws = registry.get(id as never)
+      if (ws === undefined) return undefined
+      const archived = new Set<string>(registry.archivedSessionIds)
+      return ws.sessionIds.filter(sessionId => !archived.has(sessionId))
+    },
     ...(typeof registry.archiveSession === 'function'
       ? { archiveSession: (sessionId: string) => registry.archiveSession(sessionId as Parameters<WorkspaceRegistry['archiveSession']>[0]) }
       : {}),

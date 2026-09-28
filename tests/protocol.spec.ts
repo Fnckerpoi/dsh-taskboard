@@ -126,6 +126,10 @@ describe('cron', () => {
     expect(scheduled.nextRunAt).toBeGreaterThan(0)
     expect(() => normalizeExecution({ mode: 'scheduled' }, 0)).toThrow()
     expect(() => normalizeExecution({ mode: 'bogus' }, 0)).toThrow()
+    const selected = normalizeExecution({ mode: 'scheduled', cron: '* * * * *', reuseSessionId: 'session-old' }, 0)
+    expect(selected.reuseSessionId).toBe('session-old')
+    expect(() => normalizeExecution({ mode: 'claim', reuseSessionId: 'session-old' }, 0)).toThrow('requires a scheduled task')
+    expect(() => normalizeExecution({ mode: 'scheduled', cron: '* * * * *', reuseSessionId: ' ' }, 0)).toThrow('valid session id')
   })
 })
 

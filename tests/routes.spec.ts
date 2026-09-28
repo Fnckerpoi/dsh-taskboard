@@ -308,6 +308,28 @@ describe('taskboard routes', () => {
     ])
   })
 
+  it('lists only project sessions and rejects a selected session from another project', async () => {
+    workspaces.sessionIds = id => id === 'ws-a' ? ['session-a'] : id === 'ws-b' ? ['session-b'] : undefined
+    try {
+      const listed = await (await fetch(`${base}/dsh-taskboard/project-sessions?workspaceId=ws-a`)).json()
+      expect(listed.value.sessions).toEqual([{ id: 'session-a' }])
+      expect((await fetch(`${base}/dsh-taskboard/project-sessions?workspaceId=missing`)).status).toBe(404)
+      const invalid = await post('/dsh-taskboard/tasks', {
+        title: 'Wrong session', workspaceId: 'ws-a', urgency: 'normal',
+        execution: { mode: 'scheduled', cron: '* * * * *', reuseSessionId: 'session-b' },
+      })
+      expect(invalid.status).toBe(400)
+      const created = await post('/dsh-taskboard/tasks', {
+        title: 'Selected session', workspaceId: 'ws-a', urgency: 'normal',
+        execution: { mode: 'scheduled', cron: '* * * * *', reuseSessionId: 'session-a' },
+      })
+      expect(created.status).toBe(201)
+      expect(store.get(created.json.value.id)!.execution.reuseSessionId).toBe('session-a')
+    } finally {
+      workspaces.sessionIds = undefined
+    }
+  })
+
   it('workspaces repoCount (0.6.3): root+nested and pure-container shapes enable worktree and feed the mirror badge', async () => {
     // The detect cache never expires under the fixed test clock, so each
     // shape gets its own DEDICATED workspace, pushed only for its phase and
