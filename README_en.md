@@ -239,6 +239,10 @@ node scripts/screenshot.mjs     # regenerate img/ screenshots (needs local Edge)
 
 ## Changelog
 
+### 0.8.5
+
+- **Fixed default execution permission styling in Settings**: the three choices are laid out clearly again, including the selected state.
+
 ### 0.8.4
 
 - **Continue an existing conversation for scheduled tasks ([#41](https://github.com/cloader/dsh-taskboard/issues/41))**: choose a session from the selected project when creating or editing a task. New session remains the default.

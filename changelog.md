@@ -1,5 +1,13 @@
 # 更新日志 / Changelog
 
+### 0.8.5
+
+- **修复设置页的默认执行权限样式**：三个权限选项恢复清晰的排列和选中状态。
+
+**English:**
+
+- **Fixed default execution permission styling in Settings**: the three choices are laid out clearly again, including the selected state.
+
 ### 0.8.4
 
 - **定时任务复用会话（[#41](https://github.com/cloader/dsh-taskboard/issues/41)）**：可选择当前项目的已有会话继续对话；默认仍是新建会话。指定的会话不可用时会明确提示。

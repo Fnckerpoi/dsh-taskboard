@@ -241,6 +241,10 @@ node scripts/screenshot.mjs     # 重新生成 img/ 截图（需本机 Edge）
 
 ## 升级日志
 
+### 0.8.5
+
+- **修复设置页的默认执行权限样式**：三个权限选项恢复清晰的排列和选中状态。
+
 ### 0.8.4
 
 - **定时任务可沿用已有对话（[#41](https://github.com/cloader/dsh-taskboard/issues/41)）**：创建或编辑任务时，可选择当前项目的会话；默认新建会话。
