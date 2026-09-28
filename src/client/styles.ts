@@ -483,7 +483,8 @@ button.dsh-atb-chip2.dsh-atb-chip-btn:hover {
   animation: dsh-atb-pop .16s ease;
 }
 .dsh-atb-taskform-modal {
-  width: min(960px, calc(100vw - 40px));
+  width: 1060px;
+  min-width: 1060px;
   max-height: calc(100vh - 50px);
 }
 @keyframes dsh-atb-pop { from { opacity: 0; transform: translateY(8px) scale(.98); } }
@@ -557,10 +558,13 @@ button.dsh-atb-chip2.dsh-atb-chip-btn:hover {
 }
 
 @media (max-width: 768px) {
-  .dsh-atb-taskform-modal { width: calc(100vw - 20px); }
+  .dsh-atb-taskform-modal { width: calc(100vw - 20px); min-width: 0; }
   .dsh-atb-taskform-body { grid-template-columns: 1fr; gap: 14px; padding: 12px 14px; }
   .dsh-atb-form-left { border-right: none; padding-right: 0; }
   .dsh-atb-form-right .dsh-atb-prompt-input { min-height: 90px; }
+}
+@media (min-width: 769px) and (max-width: 1099px) {
+  .dsh-atb-taskform-modal { width: calc(100vw - 40px); min-width: 0; }
 }
 .dsh-atb-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
 .dsh-atb-field[data-span="full"] { grid-column: 1 / -1; }
@@ -585,20 +589,6 @@ button.dsh-atb-chip2.dsh-atb-chip-btn:hover {
 .dsh-atb-modal-body .dsh-atb-input-bad { border-color: var(--dsw-alias-state-error-primary, #e5484d); }
 .dsh-atb-modal-body .dsh-atb-input-bad:focus { box-shadow: 0 0 0 3px color-mix(in srgb, var(--dsw-alias-state-error-primary, #e5484d) 20%, transparent); }
 
-.dsh-atb-urgency-picker { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
-.dsh-atb-urgency-opt {
-  display: flex; flex-direction: column; align-items: flex-start; gap: 3px;
-  padding: 8px 10px; border-radius: 9px; cursor: pointer;
-  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.35));
-  background: transparent; color: inherit;
-  transition: border-color .12s ease, background .12s ease;
-}
-.dsh-atb-urgency-name { display: flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; }
-.dsh-atb-urgency-hint { font-size: 10.5px; color: var(--dsw-alias-label-tertiary, gray); }
-.dsh-atb-urgency-opt:hover { border-color: var(--dsw-alias-label-tertiary, rgba(128,128,128,.6)); }
-.dsh-atb-urgency-opt[data-on="true"][data-urgency="urgent"] { border-color: rgba(229,72,77,.65); background: rgba(229,72,77,.1); }
-.dsh-atb-urgency-opt[data-on="true"][data-urgency="normal"] { border-color: rgba(142,78,198,.65); background: rgba(142,78,198,.1); }
-.dsh-atb-urgency-opt[data-on="true"][data-urgency="relaxed"] { border-color: rgba(62,99,221,.65); background: rgba(62,99,221,.1); }
 
 .dsh-atb-mode-picker { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
 .dsh-atb-mode-picker[data-exec="true"] { grid-template-columns: repeat(3, 1fr); }
@@ -885,21 +875,6 @@ color: var(--dsw-alias-state-business-primary, #3e63dd);
 .dsh-atb-storage-notice-ok { color: var(--dsw-alias-state-success-primary, #2e7d32); padding: 4px 8px; border-radius: 6px; background: rgba(46,125,50,.1); }
 .dsh-atb-storage-notice-warn { color: var(--dsw-alias-state-warning-primary, #b8860b); padding: 4px 8px; border-radius: 6px; background: rgba(184,134,11,.1); word-break: break-word; }
 
-.dsh-atb-perm-picker { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin-top: 4px; }
-.dsh-atb-perm-opt {
-  display: flex; flex-direction: column; align-items: flex-start; gap: 3px;
-  padding: 8px 10px; border-radius: 9px; cursor: pointer; text-align: left;
-  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.35));
-  background: transparent; color: inherit;
-  transition: border-color .12s ease, background .12s ease;
-}
-.dsh-atb-perm-name { display: flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; }
-.dsh-atb-perm-hint { font-size: 10.5px; color: var(--dsw-alias-label-tertiary, gray); line-height: 1.35; }
-.dsh-atb-perm-opt:hover { border-color: var(--dsw-alias-label-tertiary, rgba(128,128,128,.6)); }
-.dsh-atb-perm-opt[data-on="true"] {
-  border-color: var(--dsw-alias-brand-primary, #1f2328);
-  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #1f2328) 9%, transparent);
-}
 
 .dsh-atb-prompt-wrap {
   display: flex; flex-direction: column; gap: 6px; position: relative; width: 100%;

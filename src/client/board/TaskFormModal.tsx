@@ -1,10 +1,10 @@
 /**
  * The task form modal — create and edit in one polished dialog: header with
  * icon / subtitle / close, a sectioned field grid (title, project, model,
- * urgency tri-picker with hints, description, prompt, execution-mode
+ * urgency and permission selects, description, prompt, execution-mode
  * segmented picker, cron with presets and a live next-run preview), and a
- * footer bar carrying the validation hint and the actions. Esc closes;
- * the title input is focused on open.
+ * footer bar carrying the validation hint and the actions. The title input
+ * is focused on open; Escape, close and cancel dismiss the dialog.
  *
  * @module dsh-taskboard/client/board/TaskFormModal
  */
@@ -64,11 +64,11 @@ export function saveLastModel(model?: { provider: string; model: string; reasoni
   } catch { /* storage unavailable */ }
 }
 
-/** Urgency segmented options with a one-line hint each (translated per render). */
-const urgencyOptions = (t: Translate): ReadonlyArray<{ value: Urgency; label: string; hint: string }> => [
-  { value: 'urgent', label: t('form.urgency.urgent'), hint: t('form.urgency.urgentHint') },
-  { value: 'normal', label: t('form.urgency.normal'), hint: t('form.urgency.normalHint') },
-  { value: 'relaxed', label: t('form.urgency.relaxed'), hint: t('form.urgency.relaxedHint') },
+/** Urgency options (translated per render). */
+const urgencyOptions = (t: Translate): ReadonlyArray<{ value: Urgency; label: string }> => [
+  { value: 'urgent', label: t('form.urgency.urgent') },
+  { value: 'normal', label: t('form.urgency.normal') },
+  { value: 'relaxed', label: t('form.urgency.relaxed') },
 ]
 
 /** Cron presets offered in the scheduled mode (translated per render). */
@@ -80,10 +80,10 @@ const cronPresets = (t: Translate): ReadonlyArray<{ label: string; cron: string 
 ]
 
 /** Permission presets aligned with DSH (translated per render). */
-const permissionOptions = (t: Translate): ReadonlyArray<{ value: PermissionMode; label: string; hint: string; icon: string }> => [
-  { value: 'workspace-write', label: t('form.perm.write'), hint: t('form.perm.writeHint'), icon: '📁' },
-  { value: 'read-only', label: t('form.perm.readOnly'), hint: t('form.perm.readOnlyHint'), icon: '🔒' },
-  { value: 'danger-full-access', label: t('form.perm.fullAccess'), hint: t('form.perm.fullAccessHint'), icon: '⚡' },
+const permissionOptions = (t: Translate): ReadonlyArray<{ value: PermissionMode; label: string; icon: string }> => [
+  { value: 'workspace-write', label: t('form.perm.write'), icon: '📁' },
+  { value: 'read-only', label: t('form.perm.readOnly'), icon: '🔒' },
+  { value: 'danger-full-access', label: t('form.perm.fullAccess'), icon: '⚡' },
 ]
 
 /** Field shell: label + control, optionally spanning the full grid row. */
@@ -233,7 +233,7 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
   const [busy, setBusy] = useState(false)
   const [imageUploading, setImageUploading] = useState(false)
 
-  // Focus the title and close on Esc while the dialog is open.
+  // Focus the title on open; Escape closes the form, while backdrop clicks do not.
   useEffect(() => {
     titleRef.current?.focus()
     const onKey = (e: KeyboardEvent): void => {
@@ -436,7 +436,7 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
         : t('form.hint.createClaim')
 
   return (
-    <div className="dsh-atb-modal-backdrop" onClick={e => { if (e.target === e.currentTarget) controller.closeForm() }}>
+    <div className="dsh-atb-modal-backdrop">
       <div className="dsh-atb-modal dsh-atb-taskform-modal" data-mode={editing ? 'edit' : 'create'} role="dialog" aria-modal="true" aria-label={editing ? t('form.title.edit') : t('form.title.create')}>
         <div className="dsh-atb-modal-head">
           <span className="dsh-atb-modal-headicon">{editing ? '✎' : '✚'}</span>
@@ -529,40 +529,20 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
               )}
             </div>
 
-            <Field label={t('form.field.urgency')} full>
-              <div className="dsh-atb-urgency-picker">
-                {urgencyOptions(t).map(o => (
-                  <button
-                    key={o.value}
-                    type="button"
-                    className="dsh-atb-urgency-opt"
-                    data-urgency={o.value}
-                    data-on={urgency === o.value}
-                    onClick={() => setUrgency(o.value)}
-                  >
-                    <span className="dsh-atb-urgency-name"><span className="dsh-atb-dot" data-urgency={o.value} />{o.label}</span>
-                    <span className="dsh-atb-urgency-hint">{o.hint}</span>
-                  </button>
-                ))}
-              </div>
-            </Field>
-
-            <Field label={t('form.field.permission')} full>
-              <div className="dsh-atb-perm-picker">
-                {permissionOptions(t).map(opt => (
-                  <button
-                    key={opt.value}
-                    type="button"
-                    className="dsh-atb-perm-opt"
-                    data-on={permission === opt.value}
-                    onClick={() => setPermission(opt.value)}
-                  >
-                    <span className="dsh-atb-perm-name">{opt.icon} {opt.label}{opt.value === 'workspace-write' ? t('form.perm.defaultTag') : ''}</span>
-                    <span className="dsh-atb-perm-hint">{opt.hint}</span>
-                  </button>
-                ))}
-              </div>
-            </Field>
+            <div className="dsh-atb-form-subgrid">
+              <Field label={t('form.field.permission')}>
+                <select className="dsh-atb-permission-select" value={permission} onChange={e => setPermission(asPermission(e.target.value))}>
+                  {permissionOptions(t).map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.icon} {opt.label}{opt.value === 'workspace-write' ? t('form.perm.defaultTag') : ''}</option>
+                  ))}
+                </select>
+              </Field>
+              <Field label={t('form.field.urgency')}>
+                <select className="dsh-atb-urgency-select" value={urgency} onChange={e => setUrgency(e.target.value as Urgency)}>
+                  {urgencyOptions(t).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+              </Field>
+            </div>
 
             <Field label={t('form.field.mode')} full>
               <div className="dsh-atb-mode-picker" data-exec="true">

@@ -2173,7 +2173,7 @@ describe('client half', () => {
     localStorage.clear()
   })
 
-  it('TaskFormModal: supports permission tri-picker and SlashPromptInput (0.5.5)', async () => {
+  it('TaskFormModal: submits urgency and permission selects with SlashPromptInput', async () => {
     localStorage.clear()
     const React = await import('react')
     const { createRoot } = await import('react-dom/client')
@@ -2217,17 +2217,24 @@ describe('client half', () => {
     titleInput.dispatchEvent(new Event('change', { bubbles: true }))
 
     // Check permission options: default is workspace-write
-    const permOpts = Array.from(host.querySelectorAll<HTMLButtonElement>('.dsh-atb-perm-opt'))
+    const permissionSelect = host.querySelector<HTMLSelectElement>('.dsh-atb-permission-select')!
+    const permOpts = Array.from(permissionSelect.options)
     expect(permOpts.length).toBe(3)
     expect(permOpts[0]!.textContent).toContain('可写入工作区')
     expect(permOpts[1]!.textContent).toContain('仅可查看')
     expect(permOpts[2]!.textContent).toContain('完全权限')
-    expect(permOpts[0]!.dataset.on).toBe('true')
+    expect(permissionSelect.value).toBe('workspace-write')
 
-    // Click '仅可查看' (read-only)
-    permOpts[1]!.click()
+    // Select '仅可查看' (read-only) and urgent priority.
+    permissionSelect.value = 'read-only'
+    permissionSelect.dispatchEvent(new Event('change', { bubbles: true }))
+    const urgencySelect = host.querySelector<HTMLSelectElement>('.dsh-atb-urgency-select')!
+    expect(urgencySelect.value).toBe('normal')
+    urgencySelect.value = 'urgent'
+    urgencySelect.dispatchEvent(new Event('change', { bubbles: true }))
     await new Promise(r => setTimeout(r, 20))
-    expect(permOpts[1]!.dataset.on).toBe('true')
+    expect(permissionSelect.value).toBe('read-only')
+    expect(urgencySelect.value).toBe('urgent')
 
     // Find description textarea (SlashPromptInput)
     const textareas = host.querySelectorAll('textarea')
@@ -2247,9 +2254,10 @@ describe('client half', () => {
     await new Promise(r => setTimeout(r, 30))
 
     expect(createdPayloads).toHaveLength(1)
-    const payload = createdPayloads[0] as { title: string; permission?: string; description?: string }
+    const payload = createdPayloads[0] as { title: string; permission?: string; urgency?: string; description?: string }
     expect(payload.title).toBe('Task with read-only permission')
     expect(payload.permission).toBe('read-only')
+    expect(payload.urgency).toBe('urgent')
     expect(payload.description).toBe('使用 /goal 完成任务并按规范交付')
 
     root.unmount()

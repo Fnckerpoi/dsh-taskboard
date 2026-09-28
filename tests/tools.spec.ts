@@ -8,7 +8,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { registerTaskboardTools, type WorkspaceFace } from '../src/host/tools.ts'
+import { registerTaskboardTools, workspaceFace, type WorkspaceFace } from '../src/host/tools.ts'
 import { TaskStore } from '../src/host/store.ts'
 
 let dir: string
@@ -52,6 +52,21 @@ async function setup(deps: { modelProviders?: () => string[] | undefined; ready?
 }
 
 describe('taskboard tool outputs', () => {
+  it('omits archived sessions from a project session picker', () => {
+    const archived = ['session-b']
+    const project = { id: 'ws-a', path: '/proj/a', title: 'A', sessionIds: ['session-a', 'session-b'] }
+    const registry = {
+      get: (id: string) => id === project.id ? project : undefined,
+      list: () => [project],
+      get archivedSessionIds() { return archived },
+    } as unknown as Parameters<typeof workspaceFace>[0]
+    const face = workspaceFace(registry)
+    expect(face.sessionIds?.('ws-a')).toEqual(['session-a'])
+    expect(face.sessionIds?.('missing')).toBeUndefined()
+    archived.length = 0
+    expect(face.sessionIds?.('ws-a')).toEqual(['session-a', 'session-b'])
+  })
+
   it('registers schemas before runtime dependencies are ready and gates execution', async () => {
     const readyError = new Error('taskboard_not_ready: workspace service is starting')
     const { tool, exec } = await setup({ ready: async () => { throw readyError } })

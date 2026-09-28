@@ -1,5 +1,17 @@
 # 更新日志 / Changelog
 
+### 0.8.4
+
+- **定时任务复用会话（[#41](https://github.com/cloader/dsh-taskboard/issues/41)）**：可选择当前项目的已有会话继续对话；默认仍是新建会话。指定的会话不可用时会明确提示。
+- **看板读取更稳妥（[#42](https://github.com/cloader/dsh-taskboard/issues/42)）**：部分内容读取失败时保留已显示的任务和项目，并提供更清楚的错误提示。
+- **新建与编辑表单优化**：窗口更宽，执行权限与紧急度改为并排下拉框；点击窗口外不再关闭表单，Esc 和关闭、取消按钮仍可退出。
+
+**English:**
+
+- **Reuse a session for scheduled tasks ([#41](https://github.com/cloader/dsh-taskboard/issues/41))**: continue an existing conversation from the selected project, or keep the default new session. An unavailable selected session now produces a clear error.
+- **More reliable board loading ([#42](https://github.com/cloader/dsh-taskboard/issues/42))**: a partial refresh failure keeps tasks and projects already on screen and shows a clearer error.
+- **Create and edit form improvements**: a wider dialog, side-by-side permission and urgency dropdowns, and no dismissal by clicking outside. Esc, Close, and Cancel still dismiss the form.
+
 ### 0.8.3
 
 **修复：**
