@@ -325,6 +325,12 @@ describe('taskboard routes', () => {
       })
       expect(created.status).toBe(201)
       expect(store.get(created.json.value.id)!.execution.reuseSessionId).toBe('session-a')
+      const fresh = await post('/dsh-taskboard/tasks', {
+        title: 'Fresh by default', workspaceId: 'ws-a', urgency: 'normal',
+        execution: { mode: 'scheduled', cron: '* * * * *' },
+      })
+      expect(fresh.status).toBe(201)
+      expect(store.get(fresh.json.value.id)!.execution.sessionReuseMode).toBe('fresh')
     } finally {
       workspaces.sessionIds = undefined
     }

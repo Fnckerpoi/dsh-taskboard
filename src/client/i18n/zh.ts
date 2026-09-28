@@ -312,6 +312,8 @@ export const zh = {
   'form.field.isolation': '执行隔离',
   'form.field.reuseSession': '复用会话',
   'form.session.new': '新建会话',
+  'form.session.fresh': '每次新建会话',
+  'form.session.reuse': '首次新建会话，后续复用',
   'form.session.unavailable': '会话列表读取失败，请重试打开表单',
   'form.session.missing': '所选会话不在当前项目中，请重新选择',
   'form.iso.locked': '任务已有执行记录，隔离方式已锁定',

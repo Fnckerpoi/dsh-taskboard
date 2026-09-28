@@ -80,7 +80,7 @@ Uninstall: `dsh plugin --profile web remove dsh-taskboard` (ledger data stays in
 
 ## Quick Start
 
-**Step 1 · Create a card**: click "+ New Task" in the board toolbar — pick a project, urgency, execution mode (claim / one-shot / periodic cron), model and preset, Git isolation toggle, and an acceptance checklist. Scheduled tasks can reuse a project session (the default is a new session). Periodic tasks also choose whether completion returns to todo or creates a new todo card; tick "⚡ Run now" to execute immediately.
+**Step 1 · Create a card**: click "+ New Task" in the board toolbar — pick a project, urgency, execution mode (claim / one-shot / periodic cron), model and preset, Git isolation toggle, and an acceptance checklist. A one-shot task can start a new session or use an existing project session. A periodic task independently chooses a new session every run, create-first-then-reuse, or an existing project session, as well as whether completion returns to todo or creates a successor card; tick "⚡ Run now" to execute immediately.
 
 **Step 2 · An agent executes it**, triggered any of three ways:
 
@@ -130,7 +130,7 @@ Available in any session. Project boundary: only sessions belonging to the task'
 - Tasks belong to projects: claiming validates session ownership — no snatching across projects
 - Three-color urgency (urgent red / normal purple / relaxed blue) with filtering and color bars; search (title / ID) and in-column sorting; filters and sorting persist
 - Status-colored dots on column headers: backlog gray / todo blue / in-progress orange / in-review purple / done green / deleted red
-- Create/edit modal: project, model (with reasoning effort), urgency, execution mode, cron with live validation & next-run preview, periodic completion policy, isolation toggle, checklist editor
+- Create/edit modal: project, model (with reasoning effort), urgency, execution mode, cron with live validation & next-run preview, periodic completion and independent session policies, isolation toggle, checklist editor
 - Detail panel: status transitions (*done* is human-only; completing with unchecked items asks for confirmation and shows the count), agent/user comment thread, execution history (newest first; session IDs open the execution session on click; deleted/archived targets get distinct notices), stop execution, worktree isolation block (branch / commits / change stats / merge & cleanup), execution report block, acceptance checklist block
 - Quick actions on In Review cards: "✓ Done" one-click accept, "✗ Send back" returns to Todo with an optional reason agents read before starting
 - **Image attachments (0.7.0)**: task descriptions and comments accept PNG/JPEG/GIF/WebP through file picker, paste, or drag and drop and insert Markdown automatically; task details show thumbnails with click-to-zoom lightbox previews. Images stay in the local data directory, capped at 5 MiB each
@@ -238,6 +238,10 @@ node scripts/screenshot.mjs     # regenerate img/ screenshots (needs local Edge)
 ```
 
 ## Changelog
+
+### 0.8.6
+
+- **Improved periodic session reuse logic**: cron tasks can create a new session every run, or create one on the first run and continue it on later periods. This choice no longer depends on whether periodic completion rearms the current card or creates a successor. One-shot tasks retain their original single-run semantics; existing periodic tasks retain their prior automatic-reuse behavior.
 
 ### 0.8.5
 

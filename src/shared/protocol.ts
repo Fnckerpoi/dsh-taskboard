@@ -292,14 +292,27 @@ export type PeriodicCompletion = 'rearm' | 'spawn'
 /** Default periodic behavior: keep this round for review and create the next todo card. */
 export const DEFAULT_PERIODIC_COMPLETION: PeriodicCompletion = 'spawn'
 
+/** How a scheduled task obtains its conversation when no existing session is selected. */
+export type ScheduledSessionReuseMode = 'fresh' | 'reuse'
+
 /**
  * Per-task execution configuration. `claim` tasks wait for an in-project
  * session to claim them; `scheduled` tasks run on the host cron scheduler.
  */
 export interface ExecutionConfig {
   mode: ExecutionMode
-  /** Explicit existing project session to continue on scheduled runs. Omitted starts with a new session. */
+  /** Explicit existing project session to continue on scheduled runs. This is a mandatory selection. */
   reuseSessionId?: string
+  /**
+   * Periodic-cron-only policy: `fresh` creates a conversation for every
+   * trigger; `reuse` creates one on the first trigger then continues it.
+   * Omitted is the legacy `reuse` behavior, retained for already-saved tasks.
+   */
+  sessionReuseMode?: ScheduledSessionReuseMode
+  /** Host-owned continuation pointer for `sessionReuseMode: 'reuse'`. */
+  autoReuseSessionId?: string
+  /** Effective configuration paired with {@link autoReuseSessionId}. */
+  autoReuseSessionKey?: string
   /**
    * Five-field cron expression (minute hour day month weekday). Present on
    * PERIODIC scheduled tasks (定期执行): the scheduler refires the task each
@@ -735,7 +748,10 @@ export function spawnNextCycle(source: TaskRecord, prevExecutionId: string | und
     status: 'todo',
     blocked: false,
     execution: { mode: 'scheduled', cron, nextRunAt: next, periodicCompletion: source.execution.periodicCompletion ?? DEFAULT_PERIODIC_COMPLETION,
-      ...(source.execution.reuseSessionId !== undefined ? { reuseSessionId: source.execution.reuseSessionId } : {}) },
+      ...(source.execution.reuseSessionId !== undefined ? { reuseSessionId: source.execution.reuseSessionId } : {}),
+      ...(source.execution.sessionReuseMode !== undefined ? { sessionReuseMode: source.execution.sessionReuseMode } : {}),
+      ...(source.execution.autoReuseSessionId !== undefined ? { autoReuseSessionId: source.execution.autoReuseSessionId } : {}),
+      ...(source.execution.autoReuseSessionKey !== undefined ? { autoReuseSessionKey: source.execution.autoReuseSessionKey } : {}) },
     ...(source.model !== undefined ? { model: structuredClone(source.model) } : {}),
     ...(source.isolation !== undefined ? { isolation: source.isolation } : {}),
     ...(source.presetId !== undefined ? { presetId: source.presetId } : {}),
@@ -910,7 +926,7 @@ function normalizeRunAt(raw: unknown): number | undefined {
  * @returns the normalized config.
  */
 export function normalizeExecution(
-  raw: { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown },
+  raw: { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown; sessionReuseMode?: unknown },
   now: number,
   opts?: { allowPastRunAt?: boolean },
 ): ExecutionConfig {
@@ -921,6 +937,7 @@ export function normalizeExecution(
   if (mode === 'claim') {
     if (raw.periodicCompletion !== undefined) throw new Error('execution.periodicCompletion requires a cron schedule')
     if (raw.reuseSessionId !== undefined) throw new Error('execution.reuseSessionId requires a scheduled task')
+    if (raw.sessionReuseMode !== undefined) throw new Error('execution.sessionReuseMode requires a scheduled task')
     return { mode }
   }
   if (raw.reuseSessionId !== undefined && (typeof raw.reuseSessionId !== 'string' || raw.reuseSessionId.length === 0
@@ -928,6 +945,10 @@ export function normalizeExecution(
     throw new Error('execution.reuseSessionId must be a valid session id')
   }
   const reuseSession = raw.reuseSessionId === undefined ? {} : { reuseSessionId: raw.reuseSessionId as string }
+  if (raw.sessionReuseMode !== undefined && raw.sessionReuseMode !== 'fresh' && raw.sessionReuseMode !== 'reuse') {
+    throw new Error("execution.sessionReuseMode must be 'fresh' or 'reuse'")
+  }
+  const sessionReuseMode = raw.sessionReuseMode === undefined ? {} : { sessionReuseMode: raw.sessionReuseMode as ScheduledSessionReuseMode }
   const runAt = normalizeRunAt(raw.runAt)
   const cron = (raw.cron ?? '').trim()
   if (cron.length > 0 && runAt !== undefined) {
@@ -935,6 +956,7 @@ export function normalizeExecution(
   }
   if (runAt !== undefined) {
     if (raw.periodicCompletion !== undefined) throw new Error('execution.periodicCompletion requires a cron schedule')
+    if (raw.sessionReuseMode !== undefined) throw new Error('execution.sessionReuseMode requires a cron schedule')
     if (!opts?.allowPastRunAt && runAt <= now) throw new Error('execution.runAt must be in the future')
     return { mode, runAt, nextRunAt: runAt, ...reuseSession }
   }
@@ -946,7 +968,7 @@ export function normalizeExecution(
   if (periodicCompletion !== 'rearm' && periodicCompletion !== 'spawn') {
     throw new Error("execution.periodicCompletion must be 'rearm' or 'spawn'")
   }
-  return { mode, cron, nextRunAt: next, periodicCompletion, ...reuseSession }
+  return { mode, cron, nextRunAt: next, periodicCompletion, ...reuseSession, ...sessionReuseMode }
 }
 
 /**
@@ -1267,13 +1289,23 @@ export function validateImportedTask(raw: unknown, now: number): { ok: true; tas
   if (!isValidTaskId(id)) return fail('missing/invalid id (must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$)')
   try {
     const rawExecution = typeof e.execution === 'object' && e.execution !== null
-      ? e.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown; queuedRunAt?: unknown; queuedAt?: unknown; dispatchingRunAt?: unknown }
+      ? e.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown; sessionReuseMode?: unknown; autoReuseSessionId?: unknown; autoReuseSessionKey?: unknown; queuedRunAt?: unknown; queuedAt?: unknown; dispatchingRunAt?: unknown }
       : {}
     const execution = normalizeExecution(
       rawExecution,
       now,
       { allowPastRunAt: true },
     )
+    // These pointers are host-owned runtime state. Retain only well-formed
+    // values from an exported ledger; a stale pointer merely falls back to a
+    // fresh conversation when the next scheduled run starts.
+    if (execution.sessionReuseMode !== 'fresh' && typeof rawExecution.autoReuseSessionId === 'string'
+      && rawExecution.autoReuseSessionId.length > 0 && rawExecution.autoReuseSessionId.length <= 256) {
+      execution.autoReuseSessionId = rawExecution.autoReuseSessionId
+      if (typeof rawExecution.autoReuseSessionKey === 'string' && rawExecution.autoReuseSessionKey.length <= 1024) {
+        execution.autoReuseSessionKey = rawExecution.autoReuseSessionKey
+      }
+    }
     // Queue markers are scheduler-owned, but must survive export/import: an
     // online-and-queued window is not equivalent to an offline missed window.
     const queuedWindow = typeof rawExecution.queuedRunAt === 'number' && Number.isFinite(rawExecution.queuedRunAt)

@@ -688,7 +688,14 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
           if (status !== 'backlog' && status !== 'todo') {
             throw new Error('Error: invalid_transition: a new task must start as backlog or todo')
           }
-          const execution = normalizeExecution((body.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown } | undefined) ?? {}, options.now())
+          const execution = normalizeExecution((body.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown; sessionReuseMode?: unknown } | undefined) ?? {}, options.now())
+          // New API-created scheduled tasks follow the same explicit default
+          // as the form: create a fresh conversation on each trigger. Only
+          // pre-existing ledgers with an omitted policy retain #26 behavior.
+          if (execution.mode === 'scheduled' && execution.cron !== undefined
+            && execution.reuseSessionId === undefined && execution.sessionReuseMode === undefined) {
+            execution.sessionReuseMode = 'fresh'
+          }
           if (execution.reuseSessionId !== undefined && !workspaces.sessionIds?.(workspaceId)?.includes(execution.reuseSessionId)) {
             throw new Error('Error: invalid_input: selected session is not available in this workspace')
           }
@@ -787,7 +794,17 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
               }
               if (typeof body.blocked === 'boolean') next.blocked = body.blocked
               // The GUI (task owner surface) may edit model/execution; null clears the model.
-              if (body.execution !== undefined) next.execution = normalizeExecution(body.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown }, options.now())
+              if (body.execution !== undefined) {
+                const previousExecution = next.execution
+                next.execution = normalizeExecution(body.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown; sessionReuseMode?: unknown }, options.now())
+                // The client never owns the learned continuation pointer. Keep
+                // it when the task remains on the same auto-reuse policy.
+                if (next.execution.reuseSessionId === undefined && next.execution.sessionReuseMode === 'reuse'
+                  && previousExecution.reuseSessionId === undefined && previousExecution.sessionReuseMode !== 'fresh') {
+                  next.execution.autoReuseSessionId = previousExecution.autoReuseSessionId
+                  next.execution.autoReuseSessionKey = previousExecution.autoReuseSessionKey
+                }
+              }
               if (next.execution.reuseSessionId !== undefined && !workspaces.sessionIds?.(next.workspaceId)?.includes(next.execution.reuseSessionId)) {
                 throw new Error('Error: invalid_input: selected session is not available in this workspace')
               }

@@ -186,7 +186,14 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
   const [periodicCompletion, setPeriodicCompletion] = useState<PeriodicCompletion>(
     task?.execution.periodicCompletion ?? prefill?.execution?.periodicCompletion ?? 'spawn',
   )
-  const [reuseSessionId, setReuseSessionId] = useState(task?.execution.reuseSessionId ?? '')
+  type SessionChoice = 'fresh' | 'reuse' | `selected:${string}`
+  const initialSessionChoice: SessionChoice = task?.execution.reuseSessionId !== undefined
+    ? `selected:${task.execution.reuseSessionId}`
+    // Existing tasks without a policy kept #26's auto-reuse behavior.
+    : task !== undefined ? (task.execution.sessionReuseMode ?? 'reuse')
+      : prefill?.execution?.reuseSessionId !== undefined ? `selected:${prefill.execution.reuseSessionId}`
+        : prefill?.execution?.sessionReuseMode ?? 'fresh'
+  const [sessionChoice, setSessionChoice] = useState<SessionChoice>(initialSessionChoice)
   const [projectSessions, setProjectSessions] = useState<Array<{ id: string; title?: string }>>([])
   const [sessionsLoading, setSessionsLoading] = useState(false)
   const [sessionsError, setSessionsError] = useState(false)
@@ -283,13 +290,18 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
   const runAtMs = mode === 'once' && runAt !== '' ? new Date(runAt).getTime() : NaN
   const runAtBad = mode === 'once' && (runAt === '' || Number.isNaN(runAtMs) || runAtMs <= Date.now())
   const valid = title.trim().length > 0 && workspaceId !== '' && !cronBad && !runAtBad
-    && (mode === 'claim' || reuseSessionId === '' || (!sessionsLoading && projectSessions.some(s => s.id === reuseSessionId)))
+    && (mode === 'claim' || !sessionChoice.startsWith('selected:') || (!sessionsLoading && projectSessions.some(s => s.id === sessionChoice.slice('selected:'.length))))
 
   /** Execution payload for submit: claim | periodic (cron) | one-shot (runAt ISO). */
-  const executionPayload = (): { mode: 'claim' | 'scheduled'; cron?: string; runAt?: string; periodicCompletion?: PeriodicCompletion; reuseSessionId?: string } => {
-    const reuse = reuseSessionId === '' ? {} : { reuseSessionId }
+  const executionPayload = (): { mode: 'claim' | 'scheduled'; cron?: string; runAt?: string; periodicCompletion?: PeriodicCompletion; reuseSessionId?: string; sessionReuseMode?: 'fresh' | 'reuse' } => {
+    const reuse = sessionChoice.startsWith('selected:')
+      ? { reuseSessionId: sessionChoice.slice('selected:'.length) }
+      : { sessionReuseMode: sessionChoice === 'reuse' ? 'reuse' as const : 'fresh' as const }
     if (mode === 'periodic') return { mode: 'scheduled', cron: cron.trim(), periodicCompletion, ...reuse }
-    if (mode === 'once') return { mode: 'scheduled', runAt: new Date(runAt).toISOString(), ...reuse }
+    // A one-shot task has no later trigger to reuse. Preserve its original
+    // contract: new conversation by default, or one explicit project session.
+    if (mode === 'once') return { mode: 'scheduled', runAt: new Date(runAt).toISOString(),
+      ...(sessionChoice.startsWith('selected:') ? { reuseSessionId: sessionChoice.slice('selected:'.length) } : {}) }
     return { mode: 'claim' }
   }
 
@@ -456,7 +468,7 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
 
             <div className="dsh-atb-form-subgrid">
               <Field label={t('form.field.project')} required>
-                <select value={workspaceId} onChange={e => { setWorkspaceId(e.target.value); setReuseSessionId(''); setProjectSessions([]) }}>
+                <select value={workspaceId} onChange={e => { setWorkspaceId(e.target.value); setSessionChoice('fresh'); setProjectSessions([]) }}>
                   {state.workspaces.map(ws => <option key={ws.id} value={ws.id}>{ws.title || ws.path}</option>)}
                 </select>
               </Field>
@@ -613,15 +625,30 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
               </>
             )}
 
-            {mode !== 'claim' && (
+            {mode === 'periodic' && (
               <Field label={t('form.field.reuseSession')} full>
-                <select value={reuseSessionId} onChange={e => setReuseSessionId(e.target.value)}>
-                  <option value="">{t('form.session.new')}</option>
+                <select value={sessionChoice} onChange={e => setSessionChoice(e.target.value as SessionChoice)}>
+                  <option value="fresh">{t('form.session.fresh')}</option>
+                  <option value="reuse">{t('form.session.reuse')}</option>
+                  {projectSessions.map(session => <option key={session.id} value={`selected:${session.id}`}>{session.title ?? session.id}</option>)}
+                </select>
+                {sessionsLoading && <span className="dsh-atb-isolation-note">{t('shared.loading')}</span>}
+                {sessionsError && <span className="dsh-atb-isolation-note">{t('form.session.unavailable')}</span>}
+                {!sessionsLoading && !sessionsError && sessionChoice.startsWith('selected:') && !projectSessions.some(session => session.id === sessionChoice.slice('selected:'.length)) && (
+                  <span className="dsh-atb-isolation-note">{t('form.session.missing')}</span>
+                )}
+              </Field>
+            )}
+
+            {mode === 'once' && (
+              <Field label={t('form.field.reuseSession')} full>
+                <select value={sessionChoice.startsWith('selected:') ? sessionChoice : 'fresh'} onChange={e => setSessionChoice(e.target.value === 'fresh' ? 'fresh' : `selected:${e.target.value}`)}>
+                  <option value="fresh">{t('form.session.new')}</option>
                   {projectSessions.map(session => <option key={session.id} value={session.id}>{session.title ?? session.id}</option>)}
                 </select>
                 {sessionsLoading && <span className="dsh-atb-isolation-note">{t('shared.loading')}</span>}
                 {sessionsError && <span className="dsh-atb-isolation-note">{t('form.session.unavailable')}</span>}
-                {!sessionsLoading && !sessionsError && reuseSessionId !== '' && !projectSessions.some(session => session.id === reuseSessionId) && (
+                {!sessionsLoading && !sessionsError && sessionChoice.startsWith('selected:') && !projectSessions.some(session => session.id === sessionChoice.slice('selected:'.length)) && (
                   <span className="dsh-atb-isolation-note">{t('form.session.missing')}</span>
                 )}
               </Field>

@@ -632,13 +632,21 @@ export class ExecutionService {
         if (resumed === undefined) throw new Error(`selected session ${selectedSessionId} is unavailable, busy, archived, or incompatible`)
         handle = resumed
       } else {
-        // "New session" starts a fresh conversation on the first trigger;
-        // later periodic triggers retain the existing #26 continuity policy.
+        // A task can explicitly require a fresh conversation every time. Old
+        // ledgers omit sessionReuseMode and deliberately retain #26's legacy
+        // auto-reuse behavior.
+        const reuseCreatedSession = trigger === 'scheduled' && task.execution.cron !== undefined
+          && task.execution.sessionReuseMode !== 'fresh'
         const previous = trigger === 'scheduled'
           ? [...task.executions].reverse().find(e => e.trigger === 'scheduled' && e.sessionId !== undefined)
           : undefined
-        const resumed = previous?.sessionReuseKey === sessionReuseKey && previous.sessionId !== undefined
-          ? await this.deps.agents.resumeScheduled?.(previous.sessionId, createOptions)
+        const automaticSessionId = task.execution.autoReuseSessionId
+          ?? (previous?.sessionReuseKey === sessionReuseKey ? previous.sessionId : undefined)
+        const automaticSessionKey = task.execution.autoReuseSessionId !== undefined
+          ? task.execution.autoReuseSessionKey
+          : previous?.sessionReuseKey
+        const resumed = reuseCreatedSession && automaticSessionKey === sessionReuseKey && automaticSessionId !== undefined
+          ? await this.deps.agents.resumeScheduled?.(automaticSessionId, createOptions)
           : undefined
         handle = resumed ?? await this.deps.agents.create(createOptions)
       }
@@ -693,6 +701,14 @@ export class ExecutionService {
       const execution = target?.executions.find(e => e.id === executionId && e.outcome === 'running')
       if (target === undefined || execution === undefined) return undefined
       Object.assign(execution, { sessionId, ...(trigger === 'scheduled' ? { sessionReuseKey } : {}) })
+      // `reuse` is independent of periodic completion: once the first run
+      // creates a session, successor cards inherit this pointer and continue
+      // it; `fresh` never records a continuation target.
+      if (trigger === 'scheduled' && target.execution.cron !== undefined && target.execution.reuseSessionId === undefined
+        && target.execution.sessionReuseMode !== 'fresh') {
+        target.execution.autoReuseSessionId = sessionId
+        target.execution.autoReuseSessionKey = sessionReuseKey
+      }
       target.claimedBy = sessionId
       return [target]
     })

@@ -1,5 +1,13 @@
 # 更新日志 / Changelog
 
+### 0.8.6
+
+- **完善定期会话关于复用会话的逻辑**：新建或编辑“定期执行（cron）”任务时可选择“每次新建会话”或“首次新建会话，后续复用”，也可继续明确选择项目中的既有会话。无论任务完成后是复位当前卡还是新建下一轮卡，这个选择都保持不变；“首次新建、后续复用”会把首轮会话安全传给下一张周期卡。一次性定时任务维持原有的一次执行语义。既有定期任务保持此前的自动续用行为，避免升级后静默改变行为。
+
+**English:**
+
+- **Improved periodic session reuse logic**: periodic cron tasks can now choose “new session every time” or “create first, then reuse,” in addition to explicitly selecting an existing project session. The choice is preserved whether a periodic run rearms its card or spawns a successor; the create-then-reuse policy safely passes its initial conversation to that successor. One-shot scheduled tasks retain their original single-run semantics, and existing periodic tasks retain their previous automatic-reuse behavior.
+
 ### 0.8.5
 
 - **修复设置页的默认执行权限样式**：三个权限选项恢复清晰的排列和选中状态。

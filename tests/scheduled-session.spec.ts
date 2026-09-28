@@ -79,7 +79,10 @@ async function fixture() {
         const t = l.tasks.find(x => x.id === task.id)!
         t.status = 'todo'
         t.execution = { mode: 'scheduled', cron: '* * * * *', periodicCompletion: 'rearm',
-          ...(t.execution.reuseSessionId !== undefined ? { reuseSessionId: t.execution.reuseSessionId } : {}) }
+          ...(t.execution.reuseSessionId !== undefined ? { reuseSessionId: t.execution.reuseSessionId } : {}),
+          ...(t.execution.sessionReuseMode !== undefined ? { sessionReuseMode: t.execution.sessionReuseMode } : {}),
+          ...(t.execution.autoReuseSessionId !== undefined ? { autoReuseSessionId: t.execution.autoReuseSessionId } : {}),
+          ...(t.execution.autoReuseSessionKey !== undefined ? { autoReuseSessionKey: t.execution.autoReuseSessionKey } : {}) }
         return [t]
       })
     }
@@ -95,6 +98,46 @@ describe('scheduled session reuse', () => {
     const f = await fixture()
     const source = { ...f.task, execution: { ...f.task.execution, reuseSessionId: 'existing-session' } }
     expect(spawnNextCycle(source, undefined, Date.now()).execution.reuseSessionId).toBe('existing-session')
+  })
+
+  it('carries an auto-created continuation pointer to a periodic successor card', async () => {
+    const f = await fixture()
+    const first = await f.run()
+    const source = f.store.get(f.task.id)!
+    expect(source.execution.autoReuseSessionId).toBe(first.sessionId)
+    const next = spawnNextCycle(source, first.executionId, Date.now())
+    expect(next.execution.sessionReuseMode).toBeUndefined() // legacy #26 task remains legacy-compatible
+    expect(next.execution.autoReuseSessionId).toBe(first.sessionId)
+    expect(next.execution.autoReuseSessionKey).toBeDefined()
+    await f.finish(first.sessionId)
+  })
+
+  it('creates a fresh session for every trigger when the policy is fresh', async () => {
+    const f = await fixture()
+    await f.store.mutate('task-updated', ledger => {
+      ledger.tasks[0]!.execution.sessionReuseMode = 'fresh'
+      return [ledger.tasks[0]!]
+    })
+    const first = await f.run()
+    await f.finish(first.sessionId)
+    const second = await f.run()
+    expect(second.sessionId).not.toBe(first.sessionId)
+    expect(f.create).toHaveBeenCalledTimes(2)
+    await f.finish(second.sessionId)
+  })
+
+  it('uses one initial session for later triggers when the policy is reuse', async () => {
+    const f = await fixture()
+    await f.store.mutate('task-updated', ledger => {
+      ledger.tasks[0]!.execution.sessionReuseMode = 'reuse'
+      return [ledger.tasks[0]!]
+    })
+    const first = await f.run()
+    await f.finish(first.sessionId)
+    const second = await f.run()
+    expect(second.sessionId).toBe(first.sessionId)
+    expect(f.create).toHaveBeenCalledTimes(1)
+    await f.finish(second.sessionId)
   })
 
   it('uses the selected project session and fails clearly instead of silently replacing it', async () => {

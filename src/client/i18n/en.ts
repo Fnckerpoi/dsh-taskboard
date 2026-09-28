@@ -310,6 +310,8 @@ export const en: TaskboardDict = {
   'form.field.isolation': 'Execution isolation',
   'form.field.reuseSession': 'Reuse session',
   'form.session.new': 'New session',
+  'form.session.fresh': 'New session every time',
+  'form.session.reuse': 'Create first, then reuse',
   'form.session.unavailable': 'Could not load sessions; reopen this form to retry',
   'form.session.missing': 'Selected session is unavailable in this project',
   'form.iso.locked': 'The task has execution history; isolation is locked',
