@@ -57,6 +57,22 @@ async function setup(initial: BoardSettings = {}) {
 }
 
 describe('board model, effort and preset defaults', () => {
+  it.each(['unavailable', 'missing-effort'] as const)('shows and submits the saved effort when the catalog is %s', async catalogState => {
+    const model = { ...boardModel, reasoningEffort: 'xhigh' }
+    const view = await setup({ defaultModel: model, defaultPresetId: 'custom' })
+    if (catalogState === 'unavailable') view.controller.installModelCatalog(async () => [])
+    view.root.render(React.createElement(TaskFormModal, { controller: view.controller }))
+    await waitFor(() => view.field('执行模式（preset）').options.length === 3)
+    const effort = view.field('思考强度（Reasoning Effort）')
+    expect(effort.value).toBe('xhigh')
+    expect(effort.selectedOptions[0]?.textContent).toBe('xhigh')
+    view.title()
+    await waitFor(() => !view.button('创建任务').disabled)
+    view.button('创建任务').click()
+    await waitFor(() => view.created.length === 1)
+    expect(view.created[0]?.model).toEqual(model)
+  })
+
   it('stages and saves defaults, resets effort on model change, and can clear back to deployment defaults', async () => {
     const view = await setup({ defaultModel: boardModel, defaultPresetId: 'custom' })
     const { root, controller, field, change, button, saved } = view

@@ -511,6 +511,11 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
                     title={t('form.field.effortTitle')}
                   >
                     <option value="">{t('form.effort.follow')}{modelReasoning?.defaultEffort !== undefined ? t('shared.current', { name: modelReasoning.efforts.find(ef => ef.id === modelReasoning.defaultEffort)?.name ?? modelReasoning.defaultEffort }) : ''}</option>
+                    {reasoningEffort !== '' && !(modelReasoning !== undefined && modelReasoning.efforts.length > 0
+                      ? modelReasoning.efforts.some(eff => eff.id === reasoningEffort)
+                      : ['low', 'medium', 'high', 'none'].includes(reasoningEffort)) && (
+                      <option value={reasoningEffort}>{reasoningEffort}</option>
+                    )}
                     {modelReasoning !== undefined && modelReasoning.efforts.length > 0 ? (
                       modelReasoning.efforts.map(eff => (
                         <option key={eff.id} value={eff.id}>
