@@ -15,8 +15,11 @@ import {
   newCommentId,
   newExecutionId,
   newTaskId,
+  nextCronTime,
   normalizeBody,
   normalizeTitle,
+  parseCron,
+  spawnNextCycle,
   type TaskRecord,
 } from '../shared/protocol.ts'
 import type { EventsFace } from './execution.ts'
@@ -202,6 +205,7 @@ export interface SessionSyncDeps {
 
 /** Default scan interval: 4s. */
 export const DEFAULT_SCAN_INTERVAL_MS = 4000
+const ACTIVITY_PERSIST_MS = 60_000
 
 /**
  * Service that synchronizes external workspace sessions into the taskboard.
@@ -209,11 +213,12 @@ export const DEFAULT_SCAN_INTERVAL_MS = 4000
 export class ExternalSessionSyncService {
   private readonly unsubscribe: () => void
   private readonly ignoredSessions = new Set<string>()
+  private readonly lastActivityAt = new Map<string, number>()
   private scanTimer?: NodeJS.Timeout | number
 
   constructor(private readonly deps: SessionSyncDeps) {
     this.unsubscribe = deps.events.onSessionEvent((sessionId, event, sessionMeta) => {
-      void this.handleSessionEvent(sessionId, event, sessionMeta)
+      return this.handleSessionEvent(sessionId, event, sessionMeta)
     })
 
     const interval = deps.scanIntervalMs ?? DEFAULT_SCAN_INTERVAL_MS
@@ -287,6 +292,7 @@ export class ExternalSessionSyncService {
                 sessionId,
                 trigger: 'manual',
                 startedAt: now,
+                lastActivityAt: now,
                 outcome: 'running',
                 isolation: 'none',
               })
@@ -338,6 +344,11 @@ export class ExternalSessionSyncService {
     if (!defaultSyncExternalSessionsOf(snapshot.settings)) return
 
     const now = this.deps.now()
+
+    if (event.type === 'turn/start' || event.type === 'user/message' || event.type === 'turn/step'
+      || event.type === 'turn/progress' || event.type === 'agent/step' || event.type === 'agent/thought') {
+      await this.touchActivity(sessionId, now)
+    }
 
     if (event.type === 'turn/start') {
       await this.handleTurnStart(sessionId, sessionMeta?.header?.cwd, now)
@@ -392,6 +403,7 @@ export class ExternalSessionSyncService {
           sessionId,
           trigger: 'manual',
           startedAt: now,
+          lastActivityAt: now,
           outcome: 'running',
           isolation: 'none',
         })
@@ -404,6 +416,25 @@ export class ExternalSessionSyncService {
       }
       return undefined
     })
+  }
+
+  /** Persist real session activity at most once per minute; claim age is not activity. */
+  private async touchActivity(sessionId: string, now: number): Promise<void> {
+    const previous = this.lastActivityAt.get(sessionId)
+    if (previous !== undefined && now - previous < ACTIVITY_PERSIST_MS) return
+    let touched = false
+    await this.deps.store.mutate('execution-recorded', ledger => {
+      const task = ledger.tasks.find(current => current.claimedBy === sessionId
+        || current.executions.some(execution => execution.sessionId === sessionId && execution.outcome === 'running'))
+      const execution = task === undefined ? undefined : [...task.executions].reverse()
+        .find(current => current.sessionId === sessionId && current.outcome === 'running')
+      if (execution === undefined) return undefined
+      if (execution.lastActivityAt !== undefined && now - execution.lastActivityAt < ACTIVITY_PERSIST_MS) return undefined
+      execution.lastActivityAt = now
+      touched = true
+      return [task!]
+    })
+    if (touched) this.lastActivityAt.set(sessionId, now)
   }
 
   private async handleTurnStart(sessionId: string, cwd: string | undefined, now: number): Promise<void> {
@@ -434,6 +465,7 @@ export class ExternalSessionSyncService {
               sessionId,
               trigger: 'manual',
               startedAt: now,
+              lastActivityAt: now,
               outcome: 'running',
               isolation: 'none',
             })
@@ -455,6 +487,7 @@ export class ExternalSessionSyncService {
           sessionId,
           trigger: 'manual',
           startedAt: now,
+          lastActivityAt: now,
           outcome: 'running',
           isolation: 'none',
         })
@@ -488,6 +521,7 @@ export class ExternalSessionSyncService {
             sessionId,
             trigger: 'manual',
             startedAt: now,
+            lastActivityAt: now,
             outcome: 'running',
             isolation: 'none',
           },
@@ -540,6 +574,7 @@ export class ExternalSessionSyncService {
           sessionId,
           trigger: 'manual',
           startedAt: now,
+          lastActivityAt: now,
           outcome: 'running',
           isolation: 'none',
         })
@@ -604,8 +639,10 @@ export class ExternalSessionSyncService {
       if (task === undefined || task.trashedAt !== undefined) return undefined
 
       // Settle running execution
+      let scheduledTrigger = false
       for (const exec of task.executions) {
         if (exec.sessionId === sessionId && exec.outcome === 'running') {
+          scheduledTrigger = exec.trigger === 'scheduled'
           exec.endedAt = now
           if (isFailure) {
             exec.outcome = 'failed'
@@ -628,6 +665,8 @@ export class ExternalSessionSyncService {
           task.comments.push({
             id: newCommentId(),
             body: normalizeBody(`[系统] 会话执行异常：${errorMessage.slice(0, 300)}；任务已退回待办。`),
+            systemKey: 'sys.sessionError',
+            systemParams: { error: errorMessage.slice(0, 300) },
             version: 1,
             createdAt: now,
           })
@@ -639,9 +678,39 @@ export class ExternalSessionSyncService {
           task.comments.push({
             id: newCommentId(),
             body: normalizeBody('[系统] 会话执行完毕，已自动进入待验收。'),
+            systemKey: 'sys.sessionDone',
             version: 1,
             createdAt: now,
           })
+          // Periodic scheduled success (定期执行): same handoff as the
+          // execution service — the finished card stays in review while a
+          // fresh todo card carries the cron onward.
+          if (scheduledTrigger && task.execution.cron !== undefined) {
+            const match = parseCron(task.execution.cron)
+            const next = match === null ? undefined : nextCronTime(match, now) ?? undefined
+            if (next !== undefined) {
+              const successor = spawnNextCycle(task, undefined, now)
+              task.execution = { mode: 'claim' }
+              task.comments.push({
+                id: newCommentId(),
+                body: normalizeBody(`[系统] 定期任务本轮执行完毕，定时已由新待办卡 ${successor.id} 承接，请审查本卡后验收。`),
+                systemKey: 'sys.periodicHandoff',
+                systemParams: { nextTaskId: successor.id },
+                version: 1,
+                createdAt: now,
+              })
+              ledger.tasks.push(successor)
+              return [task, successor]
+            }
+            task.execution = { mode: 'claim' }
+            task.comments.push({
+              id: newCommentId(),
+              body: normalizeBody('[系统] 定期表达式已无未来触发时间，本轮结束后定时停用；如需继续请重新设置。'),
+              systemKey: 'sys.cronDead',
+              version: 1,
+              createdAt: now,
+            })
+          }
         }
       }
       return [task]

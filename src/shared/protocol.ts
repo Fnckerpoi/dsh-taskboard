@@ -52,7 +52,7 @@ const TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
   todo: ['in_progress', 'backlog', 'canceled'],
   in_progress: ['in_review', 'todo', 'canceled'],
   in_review: ['in_progress', 'todo', 'done', 'canceled'],
-  done: ['archived'],
+  done: ['archived', 'todo'],
   canceled: ['archived', 'todo'],
   archived: [],
 }
@@ -121,6 +121,23 @@ export type IsolationMode = 'worktree' | 'none'
  */
 export const DEFAULT_ISOLATION: IsolationMode = 'none'
 
+/** Factory default and safe UI/API range for concurrent task executions. */
+export const DEFAULT_MAX_CONCURRENT = 3
+export const MIN_MAX_CONCURRENT = 1
+export const MAX_MAX_CONCURRENT = 100
+/** Factory default and safe UI/API range for offline missed-window handling. */
+export const DEFAULT_SCHEDULE_MISSED_AFTER_MINUTES = 5
+export const MIN_SCHEDULE_MISSED_AFTER_MINUTES = 1
+export const MAX_SCHEDULE_MISSED_AFTER_MINUTES = 1_440
+/** A queued entry's optional shelf life. Zero deliberately preserves durable replay. */
+export const DEFAULT_QUEUE_MAX_AGE_MINUTES = 0
+export const MAX_QUEUE_MAX_AGE_MINUTES = 10_080
+/** Smallest user-selectable delay; zero explicitly disables dispatch throttling. */
+export const MIN_DISPATCH_INTERVAL_MS = 0
+/** Default spacing between scheduler-created sessions. */
+export const DEFAULT_DISPATCH_INTERVAL_MS = 1_000
+export const MAX_DISPATCH_INTERVAL_MS = 60_000
+
 /** Validate an isolation value. */
 export function asIsolation(raw: string): IsolationMode {
   if (raw !== 'worktree' && raw !== 'none') {
@@ -169,6 +186,14 @@ export type BoardSettings = {
   syncExternalSessions?: boolean
   /** Default permission preset applied when a NEW task is created without an explicit choice (0.5.5, default: 'workspace-write'). */
   defaultPermission?: PermissionMode
+  /** Global cap for simultaneously running taskboard executions. */
+  maxConcurrent?: number
+  /** Only never-queued windows older than this are classified as offline misses. */
+  scheduleMissedAfterMinutes?: number
+  /** Drop an already queued window after this many minutes; zero keeps it indefinitely. */
+  queueMaxAgeMinutes?: number
+  /** Minimum delay between scheduled session starts; zero explicitly disables throttling. */
+  dispatchIntervalMs?: number
 }
 
 /** Validate raw input into sanitized {@link BoardSettings} (unknown fields dropped). */
@@ -193,6 +218,34 @@ export function asBoardSettings(raw: unknown): BoardSettings {
   if (e.defaultPermission !== undefined) {
     out.defaultPermission = asPermission(e.defaultPermission)
   }
+  if (e.maxConcurrent !== undefined) {
+    if (typeof e.maxConcurrent !== 'number' || !Number.isSafeInteger(e.maxConcurrent)
+      || e.maxConcurrent < MIN_MAX_CONCURRENT || e.maxConcurrent > MAX_MAX_CONCURRENT) {
+      throw new Error(`maxConcurrent must be an integer from ${MIN_MAX_CONCURRENT} to ${MAX_MAX_CONCURRENT}`)
+    }
+    out.maxConcurrent = e.maxConcurrent
+  }
+  if (e.scheduleMissedAfterMinutes !== undefined) {
+    if (typeof e.scheduleMissedAfterMinutes !== 'number' || !Number.isSafeInteger(e.scheduleMissedAfterMinutes)
+      || e.scheduleMissedAfterMinutes < MIN_SCHEDULE_MISSED_AFTER_MINUTES || e.scheduleMissedAfterMinutes > MAX_SCHEDULE_MISSED_AFTER_MINUTES) {
+      throw new Error(`scheduleMissedAfterMinutes must be an integer from ${MIN_SCHEDULE_MISSED_AFTER_MINUTES} to ${MAX_SCHEDULE_MISSED_AFTER_MINUTES}`)
+    }
+    out.scheduleMissedAfterMinutes = e.scheduleMissedAfterMinutes
+  }
+  if (e.queueMaxAgeMinutes !== undefined) {
+    if (typeof e.queueMaxAgeMinutes !== 'number' || !Number.isSafeInteger(e.queueMaxAgeMinutes)
+      || e.queueMaxAgeMinutes < DEFAULT_QUEUE_MAX_AGE_MINUTES || e.queueMaxAgeMinutes > MAX_QUEUE_MAX_AGE_MINUTES) {
+      throw new Error(`queueMaxAgeMinutes must be an integer from ${DEFAULT_QUEUE_MAX_AGE_MINUTES} to ${MAX_QUEUE_MAX_AGE_MINUTES}`)
+    }
+    out.queueMaxAgeMinutes = e.queueMaxAgeMinutes
+  }
+  if (e.dispatchIntervalMs !== undefined) {
+    if (typeof e.dispatchIntervalMs !== 'number' || !Number.isSafeInteger(e.dispatchIntervalMs)
+      || e.dispatchIntervalMs < MIN_DISPATCH_INTERVAL_MS || e.dispatchIntervalMs > MAX_DISPATCH_INTERVAL_MS) {
+      throw new Error(`dispatchIntervalMs must be an integer from ${MIN_DISPATCH_INTERVAL_MS} to ${MAX_DISPATCH_INTERVAL_MS}`)
+    }
+    out.dispatchIntervalMs = e.dispatchIntervalMs
+  }
   return out
 }
 
@@ -211,8 +264,36 @@ export function defaultPermissionOf(settings?: BoardSettings): PermissionMode {
   return settings?.defaultPermission ?? DEFAULT_PERMISSION
 }
 
+/** Effective global execution cap (board setting → supplied deployment default). */
+export function maxConcurrentOf(settings: BoardSettings | undefined, fallback = DEFAULT_MAX_CONCURRENT): number {
+  return settings?.maxConcurrent ?? fallback
+}
+
+/** Effective offline missed-window threshold in minutes (board setting → factory default). */
+export function scheduleMissedAfterMinutesOf(settings?: BoardSettings): number {
+  return settings?.scheduleMissedAfterMinutes ?? DEFAULT_SCHEDULE_MISSED_AFTER_MINUTES
+}
+
+/** Effective queued-work shelf life in minutes; zero means durable replay. */
+export function queueMaxAgeMinutesOf(settings?: BoardSettings): number {
+  return settings?.queueMaxAgeMinutes ?? DEFAULT_QUEUE_MAX_AGE_MINUTES
+}
+
+/** Effective minimum spacing between scheduled session starts. */
+export function dispatchIntervalMsOf(settings?: BoardSettings): number {
+  return settings?.dispatchIntervalMs ?? DEFAULT_DISPATCH_INTERVAL_MS
+}
+
 /** How a task may run. */
 export type ExecutionMode = 'claim' | 'scheduled'
+
+/** How a periodic cron task continues after a successful scheduled run. */
+export type PeriodicCompletion = 'rearm' | 'spawn'
+/** Default periodic behavior: keep this round for review and create the next todo card. */
+export const DEFAULT_PERIODIC_COMPLETION: PeriodicCompletion = 'spawn'
+
+/** How a scheduled task obtains its conversation when no existing session is selected. */
+export type ScheduledSessionReuseMode = 'fresh' | 'reuse'
 
 /**
  * Per-task execution configuration. `claim` tasks wait for an in-project
@@ -220,10 +301,48 @@ export type ExecutionMode = 'claim' | 'scheduled'
  */
 export interface ExecutionConfig {
   mode: ExecutionMode
-  /** Five-field cron expression (minute hour day month weekday); required for `scheduled`. */
+  /** Explicit existing project session to continue on scheduled runs. This is a mandatory selection. */
+  reuseSessionId?: string
+  /**
+   * Periodic-cron-only policy: `fresh` creates a conversation for every
+   * trigger; `reuse` creates one on the first trigger then continues it.
+   * Omitted is the legacy `reuse` behavior, retained for already-saved tasks.
+   */
+  sessionReuseMode?: ScheduledSessionReuseMode
+  /** Host-owned continuation pointer for `sessionReuseMode: 'reuse'`. */
+  autoReuseSessionId?: string
+  /** Effective configuration paired with {@link autoReuseSessionId}. */
+  autoReuseSessionKey?: string
+  /**
+   * Five-field cron expression (minute hour day month weekday). Present on
+   * PERIODIC scheduled tasks (定期执行): the scheduler refires the task each
+   * time it comes due while the card sits in todo.
+   */
   cron?: string
+  /**
+   * Optional host-owned completion policy for periodic cron tasks. `rearm`
+   * returns this card to todo; `spawn` preserves it for review and creates a
+   * fresh todo successor. Omitted records use the {@link DEFAULT_PERIODIC_COMPLETION}.
+   */
+  periodicCompletion?: PeriodicCompletion
+  /**
+   * One-shot trigger time (epoch ms). Present on ONE-SHOT scheduled tasks
+   * (定时执行): the scheduler fires the task once when due and consumes the
+   * field. Mutually exclusive with {@link cron}.
+   */
+  runAt?: number
   /** Next due time (epoch ms); maintained by the host scheduler. */
   nextRunAt?: number
+  /**
+   * Original due window of a scheduled dispatch waiting for global capacity.
+   * Its presence is durable: a host restart must not reclassify an already
+   * online-and-queued run as a window missed while the host was down.
+   */
+  queuedRunAt?: number
+  /** When the scheduler put {@link queuedRunAt} into its durable FIFO queue. */
+  queuedAt?: number
+  /** A queue entry reserved for an execution gate but not yet running. */
+  dispatchingRunAt?: number
   /** Last time the scheduler triggered this task (epoch ms). */
   lastTriggeredAt?: number
 }
@@ -335,6 +454,15 @@ export type Actor =
   | { kind: 'agent'; sessionId: string }
   | { kind: 'system' }
 
+/** Structured row of a multi-repo merge system comment (0.6.4). */
+export type SystemCommentRow = {
+  /** Repo path relative to the workspace ('' = the workspace root repo). */
+  repo: string
+  outcome: 'merged' | 'noop' | 'failed'
+  /** Failure reason (verbatim) when outcome = 'failed'. */
+  error?: string
+}
+
 /** A progress/report comment on a task. */
 export type CommentRecord = {
   id: string
@@ -345,6 +473,16 @@ export type CommentRecord = {
   createdAt: number
   /** The session that wrote this comment; absent for user-written ones. */
   threadId?: string
+  /**
+   * i18n key of a host-generated system message (0.6.4). The GUI localizes it
+   * at render time; `body` stays a zh fallback for agent tools / CSV / raw
+   * JSON views.
+   */
+  systemKey?: string
+  /** Flat {name} interpolation params for the system message. */
+  systemParams?: Record<string, string>
+  /** Structured per-repo rows for the multi-repo merge summary (0.6.4). */
+  systemRows?: SystemCommentRow[]
 }
 
 /** One commit produced by an isolated execution (hash + subject). */
@@ -442,9 +580,13 @@ export type ExecutionRecord = {
   id: string
   /** The session this execution ran in; set once the session is really started. */
   sessionId?: string
+  /** Effective configuration of a scheduled session; used only for compatible reuse. */
+  sessionReuseKey?: string
   /** Trigger: manual button or the host scheduler. */
   trigger: 'manual' | 'scheduled'
   startedAt?: number
+  /** Most recent observed session activity, throttled by the host. */
+  lastActivityAt?: number
   endedAt?: number
   outcome: 'running' | 'succeeded' | 'failed' | 'cancelled'
   error?: string
@@ -552,6 +694,13 @@ export type TaskRecord = {
   executions: ExecutionRecord[]
   /** How many older execution records were pruned by the retention cap. */
   executionsPruned?: number
+  /**
+   * Id of the task this card continues (0.7.x periodic execution): when a
+   * PERIODIC scheduled task succeeds, the finished card moves to in_review
+   * and a fresh todo card carrying the cron is minted to keep the cycle
+   * going. Absent on originally created tasks.
+   */
+  spawnedFrom?: string
   /** Soft-delete marker set by agent `taskboard_delete`; user confirms the purge. */
   trashedAt?: number
 }
@@ -570,6 +719,64 @@ export function pruneExecutions(task: TaskRecord): void {
   const dropped = task.executions.length - MAX_EXECUTIONS
   task.executions = task.executions.slice(-MAX_EXECUTIONS)
   task.executionsPruned = (task.executionsPruned ?? 0) + dropped
+}
+
+/**
+ * Mint the successor card of a PERIODIC scheduled task that just succeeded
+ * (0.7.x): the finished card goes to in_review for acceptance while this
+ * fresh todo card carries the cron onward, keeping the cycle alive. The
+ * next run is recomputed from `now` (no compensating catch-up burst).
+ * Pure: the caller pushes the returned record into the ledger.
+ * @param source - the finished periodic task (still carrying its cron).
+ * @param prevExecutionId - id of the execution that just succeeded.
+ * @param now - current epoch ms.
+ * @returns the successor task record.
+ */
+export function spawnNextCycle(source: TaskRecord, prevExecutionId: string | undefined, now: number): TaskRecord {
+  const cron = source.execution.cron
+  if (cron === undefined) throw new Error('spawnNextCycle: source task has no cron')
+  const match = parseCron(cron)
+  const next = match === null ? undefined : nextCronTime(match, now) ?? undefined
+  if (next === undefined) throw new Error('spawnNextCycle: cron has no upcoming match within 4 years')
+  return {
+    id: newTaskId(),
+    title: source.title,
+    description: source.description,
+    prompt: source.prompt,
+    workspaceId: source.workspaceId,
+    urgency: source.urgency,
+    status: 'todo',
+    blocked: false,
+    execution: { mode: 'scheduled', cron, nextRunAt: next, periodicCompletion: source.execution.periodicCompletion ?? DEFAULT_PERIODIC_COMPLETION,
+      ...(source.execution.reuseSessionId !== undefined ? { reuseSessionId: source.execution.reuseSessionId } : {}),
+      ...(source.execution.sessionReuseMode !== undefined ? { sessionReuseMode: source.execution.sessionReuseMode } : {}),
+      ...(source.execution.autoReuseSessionId !== undefined ? { autoReuseSessionId: source.execution.autoReuseSessionId } : {}),
+      ...(source.execution.autoReuseSessionKey !== undefined ? { autoReuseSessionKey: source.execution.autoReuseSessionKey } : {}) },
+    ...(source.model !== undefined ? { model: structuredClone(source.model) } : {}),
+    ...(source.isolation !== undefined ? { isolation: source.isolation } : {}),
+    ...(source.presetId !== undefined ? { presetId: source.presetId } : {}),
+    ...(source.permission !== undefined ? { permission: source.permission } : {}),
+    ...(source.checklist !== undefined
+      ? { checklist: source.checklist.map(item => ({ ...item, checked: false, checkedBy: undefined, checkedAt: undefined, note: undefined })) }
+      : {}),
+    ...(source.branch !== undefined ? { branch: source.branch } : {}),
+    ...(source.branches !== undefined ? { branches: { ...source.branches } } : {}),
+    spawnedFrom: source.id,
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+    createdBy: { kind: 'system' },
+    updatedBy: { kind: 'system' },
+    comments: [{
+      id: newCommentId(),
+      body: normalizeBody(`[系统] 定期任务上一轮执行完毕（执行 ${prevExecutionId ?? '未知'}），本卡承接定时继续下一轮；上一轮成果见 ${source.id} 的待验收。`),
+      systemKey: 'sys.spawnedFrom',
+      systemParams: { sourceId: source.id, executionId: prevExecutionId ?? '' },
+      version: 1,
+      createdAt: now,
+    }],
+    executions: [],
+  }
 }
 
 /** The whole durable ledger. */
@@ -692,28 +899,76 @@ export function asStatus(raw: string): TaskStatus {
 }
 
 /**
+ * Parse a raw runAt input: epoch ms number or ISO date string → epoch ms.
+ * @param raw - untyped runAt value.
+ * @returns the epoch ms, or undefined when absent.
+ */
+function normalizeRunAt(raw: unknown): number | undefined {
+  if (raw === undefined || raw === null) return undefined
+  if (typeof raw === 'number' && Number.isFinite(raw)) return Math.trunc(raw)
+  if (typeof raw === 'string') {
+    const t = Date.parse(raw)
+    if (Number.isNaN(t)) throw new Error('execution.runAt is not a valid time (epoch ms or ISO string)')
+    return t
+  }
+  throw new Error('execution.runAt must be an epoch ms number or an ISO date string')
+}
+
+/**
  * Validate an execution config request from raw tool/route input.
- * `scheduled` requires a valid cron; computes the first `nextRunAt` from
- * `now`.
+ * `scheduled` requires either a valid cron (periodic, 定期执行) or a runAt
+ * instant (one-shot, 定时执行); the two are mutually exclusive. A cron's
+ * first `nextRunAt` is computed from `now`.
  * @param raw - raw execution input ({@link ExecutionConfig} fields, untyped).
  * @param now - current epoch ms.
+ * @param opts - `allowPastRunAt` lets the import path keep a historical
+ *   one-shot instant instead of rejecting it.
  * @returns the normalized config.
  */
 export function normalizeExecution(
-  raw: { mode?: string; cron?: string },
+  raw: { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown; sessionReuseMode?: unknown },
   now: number,
+  opts?: { allowPastRunAt?: boolean },
 ): ExecutionConfig {
   const mode = raw.mode ?? 'claim'
   if (mode !== 'claim' && mode !== 'scheduled') {
     throw new Error("execution.mode must be 'claim' or 'scheduled'")
   }
-  if (mode === 'claim') return { mode }
+  if (mode === 'claim') {
+    if (raw.periodicCompletion !== undefined) throw new Error('execution.periodicCompletion requires a cron schedule')
+    if (raw.reuseSessionId !== undefined) throw new Error('execution.reuseSessionId requires a scheduled task')
+    if (raw.sessionReuseMode !== undefined) throw new Error('execution.sessionReuseMode requires a scheduled task')
+    return { mode }
+  }
+  if (raw.reuseSessionId !== undefined && (typeof raw.reuseSessionId !== 'string' || raw.reuseSessionId.length === 0
+    || raw.reuseSessionId.length > 256 || raw.reuseSessionId.trim() !== raw.reuseSessionId || /[\x00-\x1f\x7f]/.test(raw.reuseSessionId))) {
+    throw new Error('execution.reuseSessionId must be a valid session id')
+  }
+  const reuseSession = raw.reuseSessionId === undefined ? {} : { reuseSessionId: raw.reuseSessionId as string }
+  if (raw.sessionReuseMode !== undefined && raw.sessionReuseMode !== 'fresh' && raw.sessionReuseMode !== 'reuse') {
+    throw new Error("execution.sessionReuseMode must be 'fresh' or 'reuse'")
+  }
+  const sessionReuseMode = raw.sessionReuseMode === undefined ? {} : { sessionReuseMode: raw.sessionReuseMode as ScheduledSessionReuseMode }
+  const runAt = normalizeRunAt(raw.runAt)
   const cron = (raw.cron ?? '').trim()
+  if (cron.length > 0 && runAt !== undefined) {
+    throw new Error('execution: cron and runAt are mutually exclusive (periodic vs one-shot)')
+  }
+  if (runAt !== undefined) {
+    if (raw.periodicCompletion !== undefined) throw new Error('execution.periodicCompletion requires a cron schedule')
+    if (raw.sessionReuseMode !== undefined) throw new Error('execution.sessionReuseMode requires a cron schedule')
+    if (!opts?.allowPastRunAt && runAt <= now) throw new Error('execution.runAt must be in the future')
+    return { mode, runAt, nextRunAt: runAt, ...reuseSession }
+  }
   const match = parseCron(cron)
   if (match === null) throw new Error('execution.cron is not a valid 5-field cron expression')
   const next = nextCronTime(match, now)
   if (next === null) throw new Error('execution.cron never matches within 4 years')
-  return { mode, cron, nextRunAt: next }
+  const periodicCompletion = raw.periodicCompletion ?? DEFAULT_PERIODIC_COMPLETION
+  if (periodicCompletion !== 'rearm' && periodicCompletion !== 'spawn') {
+    throw new Error("execution.periodicCompletion must be 'rearm' or 'spawn'")
+  }
+  return { mode, cron, nextRunAt: next, periodicCompletion, ...reuseSession, ...sessionReuseMode }
 }
 
 /**
@@ -754,6 +1009,36 @@ export function syncClaim(task: TaskRecord, to: TaskStatus, now: number, holder?
     task.claimedBy = holder
     task.claimedAt = now
   }
+}
+
+/**
+ * Collect unique execution session IDs associated with a task:
+ * - executions with a non-empty `sessionId`
+ * Creator and claim sessions may serve other tasks and are never included.
+ * @param task - the task record to inspect.
+ * @returns an array of distinct session IDs in stable discovery order.
+ */
+export function taskAssociatedSessionIds(task: TaskRecord): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  const push = (raw: unknown) => {
+    if (typeof raw === 'string') {
+      const trimmed = raw.trim()
+      if (trimmed.length > 0 && !seen.has(trimmed)) {
+        seen.add(trimmed)
+        result.push(trimmed)
+      }
+    }
+  }
+
+  if (Array.isArray(task.executions)) {
+    for (const ex of task.executions) {
+      if (ex !== null && typeof ex === 'object') {
+        push((ex as { sessionId?: unknown }).sessionId)
+      }
+    }
+  }
+  return result
 }
 
 /**
@@ -1003,10 +1288,36 @@ export function validateImportedTask(raw: unknown, now: number): { ok: true; tas
   // filesystem use of a task id.
   if (!isValidTaskId(id)) return fail('missing/invalid id (must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$)')
   try {
+    const rawExecution = typeof e.execution === 'object' && e.execution !== null
+      ? e.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown; sessionReuseMode?: unknown; autoReuseSessionId?: unknown; autoReuseSessionKey?: unknown; queuedRunAt?: unknown; queuedAt?: unknown; dispatchingRunAt?: unknown }
+      : {}
     const execution = normalizeExecution(
-      typeof e.execution === 'object' && e.execution !== null ? e.execution as { mode?: string; cron?: string } : {},
+      rawExecution,
       now,
+      { allowPastRunAt: true },
     )
+    // These pointers are host-owned runtime state. Retain only well-formed
+    // values from an exported ledger; a stale pointer merely falls back to a
+    // fresh conversation when the next scheduled run starts.
+    if (execution.sessionReuseMode !== 'fresh' && typeof rawExecution.autoReuseSessionId === 'string'
+      && rawExecution.autoReuseSessionId.length > 0 && rawExecution.autoReuseSessionId.length <= 256) {
+      execution.autoReuseSessionId = rawExecution.autoReuseSessionId
+      if (typeof rawExecution.autoReuseSessionKey === 'string' && rawExecution.autoReuseSessionKey.length <= 1024) {
+        execution.autoReuseSessionKey = rawExecution.autoReuseSessionKey
+      }
+    }
+    // Queue markers are scheduler-owned, but must survive export/import: an
+    // online-and-queued window is not equivalent to an offline missed window.
+    const queuedWindow = typeof rawExecution.queuedRunAt === 'number' && Number.isFinite(rawExecution.queuedRunAt)
+      ? rawExecution.queuedRunAt
+      : typeof rawExecution.dispatchingRunAt === 'number' && Number.isFinite(rawExecution.dispatchingRunAt)
+        ? rawExecution.dispatchingRunAt
+        : undefined
+    if (execution.mode === 'scheduled' && queuedWindow !== undefined && typeof rawExecution.queuedAt === 'number'
+      && Number.isFinite(rawExecution.queuedAt)) {
+      execution.queuedRunAt = queuedWindow
+      execution.queuedAt = rawExecution.queuedAt
+    }
     const comments: CommentRecord[] = []
     if (Array.isArray(e.comments)) {
       for (const c of e.comments) {
@@ -1020,6 +1331,21 @@ export function validateImportedTask(raw: unknown, now: number): { ok: true; tas
           version: numOr(ce, 'version', 1),
           createdAt: numOr(ce, 'createdAt', now),
           ...(typeof ce.threadId === 'string' ? { threadId: ce.threadId } : {}),
+          ...(typeof ce.systemKey === 'string' && /^sys\.[A-Za-z0-9]+$/.test(ce.systemKey) && ce.systemKey.length <= 100
+            ? {
+                systemKey: ce.systemKey,
+                ...(typeof ce.systemParams === 'object' && ce.systemParams !== null && !Array.isArray(ce.systemParams)
+                  ? { systemParams: Object.fromEntries(Object.entries(ce.systemParams).filter(([key, value]) => key.length <= 100 && typeof value === 'string' && value.length <= 4000).slice(0, 20)) as Record<string, string> }
+                  : {}),
+                ...(Array.isArray(ce.systemRows)
+                  ? { systemRows: ce.systemRows.filter((row): row is SystemCommentRow => typeof row === 'object' && row !== null
+                      && typeof row.repo === 'string' && (row.repo === '' || isValidRelRepoPath(row.repo))
+                      && ['merged', 'noop', 'failed'].includes(row.outcome)
+                      && (row.error === undefined || typeof row.error === 'string'))
+                    .slice(0, MAX_MIRROR_REPOS).map(row => ({ repo: row.repo, outcome: row.outcome, ...(row.error !== undefined ? { error: row.error.slice(0, 4000) } : {}) })) }
+                  : {}),
+              }
+            : {}),
         })
       }
     } else return fail('comments must be an array')
@@ -1041,6 +1367,7 @@ export function validateImportedTask(raw: unknown, now: number): { ok: true; tas
           ...(typeof xe.sessionId === 'string' ? { sessionId: xe.sessionId } : {}),
           trigger,
           ...(typeof xe.startedAt === 'number' ? { startedAt: xe.startedAt } : {}),
+          ...(typeof xe.lastActivityAt === 'number' ? { lastActivityAt: xe.lastActivityAt } : {}),
           ...(typeof xe.endedAt === 'number' ? { endedAt: xe.endedAt } : {}),
           outcome,
           ...(outcomeRaw === 'running' ? { error: 'imported while still running (settlement watcher died with the exporting host)' } : (typeof xe.error === 'string' ? { error: xe.error } : {})),

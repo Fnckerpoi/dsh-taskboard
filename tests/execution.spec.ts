@@ -113,6 +113,17 @@ const workspaces = {
 }
 
 describe('ExecutionService', () => {
+  it('refuses a scheduled start after the task entered a non-actionable state', async () => {
+    const stopped = task({ status: 'done', execution: { mode: 'scheduled', cron: '* * * * *', nextRunAt: 999 } })
+    const store = await storeWith(stopped)
+    const svc = new ExecutionService({ store, agents: fakeAgents(), workspaces, events: fakeEvents(), now: () => 1_000 })
+
+    const result = await svc.run(stopped.id, 'scheduled')
+    expect(result).toEqual({ ok: false, error: 'scheduled task is not actionable (done)' })
+    expect(store.get(stopped.id)!.status).toBe('done')
+    expect(store.get(stopped.id)!.executions).toHaveLength(0)
+  })
+
   it('runs a task in a fresh in-project session with the pinned model', async () => {
     const store = await storeWith(task({ model: { provider: 'deepseek', model: 'reasoner' } }))
     const agents = fakeAgents()
@@ -140,11 +151,12 @@ describe('ExecutionService', () => {
     // body as a normal user message (followup, next-turn).
     expect(agents.injects).toHaveLength(1)
     expect(agents.followups).toHaveLength(1)
-    const inject = agents.injects[0] as { content: Array<{ type: string; text: string }>; source: { kind: string; plugin?: string } }
+    const inject = agents.injects[0] as { content: Array<{ type: string; text: string }>; source: { kind: string } }
     const user = agents.followups[0] as { content: Array<{ type: string; text: string }>; source: { kind: string } }
     expect(inject.content[0]!.type).toBe('text')
-    expect(inject.source.kind).toBe('plugin')
-    expect(inject.source.plugin).toBe('dsh-taskboard')
+    // dsh 0.1.7-rc.2 retired the generic `kind: 'plugin'` source; the taskboard
+    // now injects its framing line under its own producer-owned source kind.
+    expect(inject.source.kind).toBe('dsh-taskboard')
     expect(inject.content[0]!.text).toContain('【任务看板】Run me')
     expect(inject.content[0]!.text).toContain('ID: t-run')
     expect(inject.content[0]!.text).toContain('taskboard_get')
@@ -276,6 +288,47 @@ describe('ExecutionService', () => {
     expect(t.comments[0]!.body).toContain('未按协议交接')
   })
 
+  it('re-arms a periodic task even when its agent already moved it to in_review', async () => {
+    const store = await storeWith(task({ execution: { mode: 'scheduled', cron: '* * * * *', nextRunAt: 2_000, periodicCompletion: 'rearm' } }))
+    const agents = fakeAgents()
+    const svc = new ExecutionService({ store, agents, workspaces, events: fakeEvents(), now: () => 1_000 })
+    const result = await svc.run('t-run', 'scheduled')
+    if (!result.ok) throw new Error('run failed')
+    await store.mutate('task-moved', ledger => {
+      const t = ledger.tasks[0]!
+      t.status = 'in_review'
+      delete t.claimedBy
+      return [t]
+    })
+    agents.idle(result.sessionId)
+    await waitFor(() => store.get('t-run')!.executions[0]!.outcome === 'succeeded')
+    const t = store.get('t-run')!
+    expect(t.status).toBe('todo')
+    expect(t.execution).toMatchObject({ mode: 'scheduled', cron: '* * * * *', nextRunAt: 2_000, periodicCompletion: 'rearm' })
+    expect(t.comments.some(c => c.systemKey === 'sys.periodicRearmed')).toBe(true)
+  })
+
+  it('defaults an unconfigured periodic task to a todo successor even when its agent already moved it to in_review', async () => {
+    const store = await storeWith(task({ execution: { mode: 'scheduled', cron: '* * * * *', nextRunAt: 2_000 } }))
+    const agents = fakeAgents()
+    const svc = new ExecutionService({ store, agents, workspaces, events: fakeEvents(), now: () => 1_000 })
+    const result = await svc.run('t-run', 'scheduled')
+    if (!result.ok) throw new Error('run failed')
+    await store.mutate('task-moved', ledger => {
+      const t = ledger.tasks[0]!
+      t.status = 'in_review'
+      delete t.claimedBy
+      return [t]
+    })
+    agents.idle(result.sessionId)
+    await waitFor(() => store.snapshot().tasks.length === 2)
+    const [finished, successor] = store.snapshot().tasks
+    expect(finished!.status).toBe('in_review')
+    expect(finished!.execution).toEqual({ mode: 'claim' })
+    expect(successor).toMatchObject({ status: 'todo', spawnedFrom: 't-run' })
+    expect(successor!.execution).toMatchObject({ mode: 'scheduled', cron: '* * * * *', periodicCompletion: 'spawn' })
+  })
+
   it('passes pinned model and reasoningEffort to agents.create', async () => {
     const store = await storeWith(task({
       model: { provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: 'high' },
@@ -317,7 +370,7 @@ describe('ExecutionService', () => {
 
   it('notes a lighter system comment when the session commented but did not move', async () => {
     const commented = task({
-      comments: [{ id: 'c-1', body: 'done, tests pass', version: 1, createdAt: 1, threadId: 'session-worker' }],
+      comments: [{ id: 'c-1', body: 'done, tests pass', version: 1, createdAt: 1_000, threadId: 'session-worker' }],
     })
     const store = await storeWith(commented)
     const agents = fakeAgents()
@@ -368,6 +421,17 @@ describe('ExecutionService', () => {
     await waitFor(() => svc.inFlight() === 2)
     expect(svc.inFlight()).toBe(2)
     expect((await svc.run('t-4', 'manual')).ok).toBe(true)
+  })
+
+  it('reads a changed concurrency setting for each new execution gate', async () => {
+    const store = await storeWith(task({ id: 't-1' }), task({ id: 't-2' }))
+    const agents = fakeAgents()
+    let cap = 1
+    const svc = new ExecutionService({ store, agents, workspaces, events: fakeEvents(), now: () => 1_000, maxConcurrent: () => cap })
+    expect((await svc.run('t-1', 'manual')).ok).toBe(true)
+    expect((await svc.run('t-2', 'manual')).ok).toBe(false)
+    cap = 2
+    expect((await svc.run('t-2', 'manual')).ok).toBe(true)
   })
 
   it('renders {{lastExecution}} and {{lastComments}} template variables', async () => {
@@ -432,12 +496,11 @@ describe('ExecutionService', () => {
     expect(store.get('t-run')!.executions[0]!.outcome).toBe('cancelled')
   })
 
-  it('cancel after the execution settled reports failure instead of fake success', async () => {
+  it('cancel wins when requested before the queued idle watcher starts settlement', async () => {
     const store = await storeWith(task())
     const disposed: string[] = []
-    // Gate the agent dispose so a cancel in flight parks there while the
-    // run's success settlement commits first (the stale-read race that used
-    // to report 取消成功 for an already-succeeded run).
+    // Disposing a reused agent can itself resolve whenIdle. A pending idle
+    // callback must not turn a requested cancellation into success.
     let releaseDispose: (() => void) | undefined
     const disposeGate = new Promise<void>(resolve => { releaseDispose = resolve })
     let idle: (() => void) | undefined
@@ -458,21 +521,15 @@ describe('ExecutionService', () => {
     const result = await svc.run('t-run', 'manual')
     if (!result.ok) throw new Error('run failed')
 
-    // Settle the run (quiescence) and start the cancel BEFORE that settlement
-    // commits: cancel's synchronous read still sees 'running', then parks on
-    // the gated dispose while the success settlement wins the store queue.
+    // Resolve idle, then cancel synchronously before its microtask runs.
     idle!()
     const cancelling = svc.cancel('t-run')
-    await waitFor(() => store.get('t-run')!.executions[0]!.outcome === 'succeeded')
     releaseDispose!()
     const cancelled = await cancelling
-    expect(cancelled.ok).toBe(false)
-    if (!cancelled.ok) expect(cancelled.error).toContain('already settled')
-    // The committed settlement survived intact — no fabricated cancel state.
+    expect(cancelled.ok).toBe(true)
     const t = store.get('t-run')!
-    expect(t.executions[0]!.outcome).toBe('succeeded')
-    expect(t.status).toBe('in_review')
-    // The cancel really reached the dispose step (it was just too late).
+    expect(t.executions[0]!.outcome).toBe('cancelled')
+    expect(t.status).toBe('todo')
     expect(disposed).toEqual([result.sessionId])
   })
 
@@ -542,6 +599,41 @@ describe('ExecutionService', () => {
     const b = store.get('t-review')!
     expect(b.status).toBe('in_review')
     expect(b.executions[0]!.outcome).toBe('succeeded')
+  })
+
+  it('adopts a live execution during plugin reload instead of failing it as a restart', async () => {
+    const running = task({
+      id: 't-reload',
+      status: 'in_progress',
+      claimedBy: 'session-still-live',
+      claimedAt: 1,
+      executions: [{ id: 'e-reload', sessionId: 'session-still-live', trigger: 'manual', startedAt: 1, outcome: 'running' }],
+    })
+    const store = await storeWith(running)
+    let finish!: () => void
+    const idle = new Promise<void>(resolve => { finish = resolve })
+    const live = {
+      id: 'session-still-live',
+      followup: () => {},
+      inject: () => {},
+      whenIdle: () => idle,
+      cancel: () => {},
+    }
+    const svc = new ExecutionService({
+      store, agents: fakeAgents(), workspaces, events: fakeEvents(), now: () => 9_000,
+      liveAgent: id => id === 'session-still-live' ? live : undefined,
+    })
+
+    await svc.reconcile()
+    expect(store.get('t-reload')!.executions[0]!.outcome).toBe('running')
+    expect(store.get('t-reload')!.status).toBe('in_progress')
+    expect(svc.inFlight()).toBe(1)
+
+    finish()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await store.read(() => undefined)
+    expect(store.get('t-reload')!.executions[0]!.outcome).toBe('succeeded')
+    expect(store.get('t-reload')!.status).toBe('in_review')
   })
 
   it('rejects a run on a running or unknown task', async () => {
@@ -987,8 +1079,8 @@ describe('SchedulerService', () => {
     expect(runs).toEqual([])
   })
 
-  it('holds due tasks (without burning their window) while at the concurrency cap', async () => {
-    const now = 1_000_000
+  it('durably queues a due task at capacity and dispatches it after the old missed window', async () => {
+    let now = 1_000_000
     const due = task({
       id: 't-due',
       execution: { mode: 'scheduled', cron: '* * * * *', nextRunAt: now - 1 },
@@ -1004,16 +1096,51 @@ describe('SchedulerService', () => {
       },
       now: () => now,
     })
-    // At capacity: the window is NOT advanced (nextRunAt stays in the past so
-    // the next tick retries) and nothing runs.
+    // At capacity the original window is persisted as queued, rather than
+    // being left to become a false offline-missed window five minutes later.
     await scheduler.tick()
     expect(runs).toEqual([])
-    expect(store.get('t-due')!.execution.nextRunAt).toBe(now - 1)
-    // Capacity frees up → the same window fires.
+    expect(store.get('t-due')!.execution.queuedRunAt).toBe(now - 1)
+    // Capacity frees up after the old five-minute missed threshold: the same
+    // queued window still fires.
+    now += 6 * 60_000
     inflight = 0
     await scheduler.tick()
     expect(runs).toEqual(['t-due'])
-    expect(store.get('t-due')!.execution.nextRunAt).toBeGreaterThan(now)
+    expect(store.get('t-due')!.execution.queuedRunAt).toBeUndefined()
+  })
+
+  it('dispatches same-window backlog in stable FIFO batches', async () => {
+    const now = 1_000_000
+    const due = now - 1
+    const store = await storeWith(
+      task({ id: 't-c', execution: { mode: 'scheduled', cron: '* * * * *', nextRunAt: due } }),
+      task({ id: 't-a', execution: { mode: 'scheduled', cron: '* * * * *', nextRunAt: due } }),
+      task({ id: 't-b', execution: { mode: 'scheduled', cron: '* * * * *', nextRunAt: due } }),
+    )
+    const runs: string[] = []
+    let inflight = 2
+    const scheduler = new SchedulerService({
+      store,
+      execution: {
+        run: async id => { runs.push(id); inflight += 1; return { ok: true, executionId: id, sessionId: id } },
+        inFlight: () => inflight,
+      },
+      now: () => now,
+      maxConcurrent: 2,
+    })
+    await scheduler.tick()
+    expect(runs).toEqual([])
+    expect(store.snapshot().tasks.every(t => t.execution.queuedRunAt === due)).toBe(true)
+
+    inflight = 0
+    await scheduler.tick()
+    expect(runs).toEqual(['t-a', 't-b'])
+    expect(store.get('t-c')!.execution.queuedRunAt).toBe(due)
+
+    inflight = 0
+    await scheduler.tick()
+    expect(runs).toEqual(['t-a', 't-b', 't-c'])
   })
 })
 

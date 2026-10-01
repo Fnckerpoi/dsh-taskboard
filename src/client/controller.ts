@@ -1,3 +1,4 @@
+import type { SessionArchiveResult } from '../shared/api.ts'
 /**
  * The board controller: framework-free state holder the React views render
  * from. Owns the ledger snapshot, workspace listing, view state (open,
@@ -7,7 +8,7 @@
  *
  * @module dsh-taskboard/client/controller
  */
-import type { ChangeEvent, DiagnosticsResponse, DiffResponse, ImportCommitResponse, ImportPreviewResponse, MergeRepoResult, PromptCompletionsResponse, TaskTemplate, TaskTemplateSpec, UpdateTaskBody, WorkspaceView } from '../shared/api.ts'
+import type { AttachmentUpload, ChangeEvent, DiagnosticsResponse, QueueClearResponse, QueueSummary, DiffResponse, ImportCommitResponse, ImportPreviewResponse, MergeRepoResult, PromptCompletionsResponse, StorageStatus, TaskTemplate, TaskTemplateSpec, UpdateTaskBody, WorkspaceView } from '../shared/api.ts'
 import type { ChecklistItem, TaskLedger, TaskRecord, Urgency } from '../shared/protocol.ts'
 import { emptyLedger } from '../shared/protocol.ts'
 import type { TaskboardClient } from './api.ts'
@@ -47,6 +48,8 @@ function loadView(): { workspaceId?: string; urgencies: Urgency[]; sortBy: SortB
 
 /** Controller snapshot the views render. */
 export interface ControllerState {
+  archiveSessionsSupported?: boolean
+  sessionArchive?: { taskId: string; result: SessionArchiveResult }
   boardOpen: boolean
   ledger: TaskLedger
   workspaces: WorkspaceView[]
@@ -67,6 +70,10 @@ export interface ControllerState {
   diagOpen: boolean
   /** Last fetched diagnostics payload (⚙ panel). */
   diagnostics?: DiagnosticsResponse
+  /** Execution-queue popup (in-progress column chip) visible. */
+  queueOpen: boolean
+  /** Latest queue summary (refreshed on every state fetch). */
+  queue?: QueueSummary
   /** Task templates (0.4.0), lazy-loaded when the new-task menu opens. */
   templates: TaskTemplate[]
   /** Template manager modal visible. */
@@ -75,6 +82,10 @@ export interface ControllerState {
   importOpen: boolean
   /** Board-settings modal visible (0.5.0). */
   settingsOpen: boolean
+  /** Current durable-data directory, loaded when settings opens. */
+  storage?: StorageStatus
+  /** Settled migration outcome (0.7.0): success path plus non-fatal warnings. */
+  storageNotice?: { path: string; warnings: string[] }
   /** Fields a chosen template prefills into the create form (consumed on open). */
   templatePrefill?: TaskTemplateSpec
   /** Transient error surface (action failures); cleared on next success. */
@@ -94,6 +105,7 @@ function initialState(): ControllerState {
     composerOpen: false,
     secondaryOpen: false,
     diagOpen: false,
+    queueOpen: false,
     templates: [],
     tplManagerOpen: false,
     importOpen: false,
@@ -108,11 +120,14 @@ export class BoardController {
   private state: ControllerState = initialState()
   private readonly subscribers = new Set<() => void>()
   private disposed = false
+  /** External close bridge (official panel mode); undefined in legacy mode. */
+  private closeRequester: (() => void) | undefined
   private disposeStream: (() => void) | undefined
   private refreshInFlight: Promise<void> | undefined
   /** Newest change-frame revision seen on the SSE stream (S16 refresh chase). */
   private seenRevision: number | undefined
   private sessionJumper: ((sessionId: string) => Promise<SessionJumpResult>) | undefined
+  private sessionTitles: (() => Record<string, { displayTitle?: string; title?: string }>) | undefined
   /** Composer catalog faces, installed formally by the client entry (T13). */
   private readonly catalogFaces: {
     models?: () => Promise<Array<{
@@ -177,16 +192,43 @@ export class BoardController {
         // newest seen revision — bounded rounds, then give up until the next
         // frame.
         for (let round = 0; round < 3; round++) {
-          const [ledger, workspaces] = await Promise.all([
-            this.client.state(),
-            this.client.workspaces(),
+          const [ledgerResult, workspacesResult] = await Promise.allSettled([
+            Promise.resolve().then(() => this.client.state()),
+            Promise.resolve().then(() => this.client.workspaces()),
           ])
-          let selected: TaskRecord | undefined
-          if (this.state.selectedId !== undefined) {
-            selected = ledger.tasks.find(t => t.id === this.state.selectedId)
+          const patch: Partial<ControllerState> = {}
+          const errors: string[] = []
+          let resetWorkspaceFilter = false
+          if (ledgerResult.status === 'fulfilled') {
+            const ledger = ledgerResult.value
+            let selected: TaskRecord | undefined
+            if (this.state.selectedId !== undefined) {
+              selected = ledger.tasks.find(t => t.id === this.state.selectedId)
+            }
+            Object.assign(patch, {
+              archiveSessionsSupported: ledger.capabilities?.archiveSessions === true,
+              ledger,
+              queue: ledger.queue,
+              selectedId: selected === undefined ? undefined : this.state.selectedId,
+            })
+          } else {
+            errors.push(`state: ${ledgerResult.reason instanceof Error ? ledgerResult.reason.message : String(ledgerResult.reason)}`)
           }
-          this.setState({ ledger, workspaces, error: undefined, selectedId: selected === undefined ? undefined : this.state.selectedId })
-          if (this.seenRevision === undefined || ledger.revision >= this.seenRevision) break
+          if (workspacesResult.status === 'fulfilled') {
+            const workspaces = workspacesResult.value
+            patch.workspaces = workspaces
+            const currentId = this.state.filters.workspaceId
+            if (currentId !== undefined && !workspaces.some(ws => ws.id === currentId)) {
+              patch.filters = { ...this.state.filters, workspaceId: undefined }
+              resetWorkspaceFilter = true
+            }
+          } else {
+            errors.push(`workspaces: ${workspacesResult.reason instanceof Error ? workspacesResult.reason.message : String(workspacesResult.reason)}`)
+          }
+          patch.error = errors.length > 0 ? errors.join('; ') : undefined
+          this.setState(patch)
+          if (resetWorkspaceFilter) this.persistView()
+          if (ledgerResult.status !== 'fulfilled' || this.seenRevision === undefined || ledgerResult.value.revision >= this.seenRevision) break
         }
       } catch (error) {
         this.setState({ error: error instanceof Error ? error.message : String(error) })
@@ -208,8 +250,27 @@ export class BoardController {
   /** Open the board (sidebar entry). */
   openBoard(): void { this.setState({ boardOpen: true }) }
 
-  /** Close the board. */
-  closeBoard(): void { this.setState({ boardOpen: false }) }
+  /**
+   * Close the board. Official panel mode routes through the installed
+   * close requester (layout.selectPanel(null) — the host owns visibility);
+   * legacy mode flips the local boardOpen state as before.
+   */
+  closeBoard(): void {
+    if (this.closeRequester !== undefined) {
+      this.closeRequester()
+      return
+    }
+    this.setState({ boardOpen: false })
+  }
+
+  /**
+   * Install (or clear) the external close bridge. Set by the official
+   * panel mount; the legacy mount leaves it unset.
+   * @param fn - the close bridge, or undefined to restore legacy behavior.
+   */
+  installCloseRequester(fn: (() => void) | undefined): void {
+    this.closeRequester = fn
+  }
 
   /** Toggle the board. */
   toggleBoard(): void { this.setState({ boardOpen: !this.state.boardOpen }) }
@@ -292,6 +353,10 @@ export class BoardController {
     this.sessionJumper = jumper
   }
 
+  installSessionTitles(reader: () => Record<string, { displayTitle?: string; title?: string }>): void {
+    this.sessionTitles = reader
+  }
+
   /** T13: formal installers for the composer catalog faces (was a monkeypatch from the client entry). */
   installModelCatalog(fn: () => Promise<Array<{
     provider: string
@@ -331,6 +396,13 @@ export class BoardController {
   /**
    * Fetch model catalog: prefers installed runtime face, falls back to Taskboard client API (0.5.5).
    */
+  /** Sessions owned by a project, for the scheduled-run session picker. */
+  async fetchProjectSessions(workspaceId: string): Promise<Array<{ id: string; title?: string }>> {
+    const sessions = (await this.client.projectSessions(workspaceId)).sessions
+    const titles = this.sessionTitles?.() ?? {}
+    return sessions.map(session => ({ ...session, title: titles[session.id]?.displayTitle ?? titles[session.id]?.title }))
+  }
+
   async fetchModelCatalog(): Promise<Array<{
     provider: string
     model: string
@@ -422,10 +494,27 @@ export class BoardController {
     }
   }
 
-  /** Move a task (user surface: done allowed). */
-  async move(id: string, ifVersion: number, status: string): Promise<void> {
+  /** Retry session archiving without repeating the task's terminal transition. */
+  async retryArchiveSessions(id: string): Promise<void> {
     try {
-      await this.client.move(id, { ifVersion, status })
+      if (this.client.archiveSessions === undefined) return
+      const result = await this.client.archiveSessions(id)
+      this.setState({ sessionArchive: { taskId: id, result } })
+      await this.refresh()
+    } catch (error) {
+      this.setState({ error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
+  /** Move a task (user surface: done allowed). */
+  async move(id: string, ifVersion: number, status: string, options?: { archiveSessions?: boolean }): Promise<void> {
+    try {
+      const result = await this.client.move(id, {
+        ifVersion,
+        status,
+        ...(options?.archiveSessions !== undefined ? { archiveSessions: options.archiveSessions } : {}),
+      })
+      if (result.sessionArchive !== undefined) this.setState({ sessionArchive: { taskId: id, result: result.sessionArchive } })
       await this.refresh()
     } catch (error) {
       this.setState({ error: error instanceof Error ? error.message : String(error) })
@@ -504,6 +593,16 @@ export class BoardController {
     }
   }
 
+  /** Upload an image without putting its bytes in the ledger or agent context. */
+  async uploadImage(file: Blob): Promise<AttachmentUpload | undefined> {
+    try {
+      return await this.client.uploadImage(file)
+    } catch (error) {
+      this.setState({ error: error instanceof Error ? error.message : String(error) })
+      return undefined
+    }
+  }
+
   /** Trigger a manual run (fresh in-project session, pinned model); `reuse` = 续跑. */
   async run(id: string, reuse = false): Promise<void> {
     try {
@@ -566,11 +665,40 @@ export class BoardController {
   /** Close the ⚙ diagnostics panel. */
   closeDiagnostics(): void { this.setState({ diagOpen: false }) }
 
+  /** Open the execution-queue popup (in-progress column chip). */
+  openQueuePanel(): void {
+    this.setState({ queueOpen: true })
+    void this.refresh()
+  }
+
+  /** Close the execution-queue popup. */
+  closeQueuePanel(): void { this.setState({ queueOpen: false }) }
+
+  /**
+   * Drop every durable queue entry (board queue panel, double-confirm gated).
+   * @returns the clear result, or undefined on failure.
+   */
+  async clearQueue(): Promise<QueueClearResponse | undefined> {
+    try {
+      const value = await this.client.clearQueue()
+      await this.refresh()
+      return value
+    } catch (error) {
+      this.setState({ error: error instanceof Error ? error.message : String(error) })
+      return undefined
+    }
+  }
+
   /** Open the board-settings modal (0.5.0). */
-  openSettings(): void { this.setState({ settingsOpen: true }) }
+  openSettings(): void {
+    this.setState({ settingsOpen: true })
+    void this.client.storage()
+      .then(storage => this.setState({ storage, error: undefined }))
+      .catch(error => this.setState({ error: error instanceof Error ? error.message : String(error) }))
+  }
 
   /** Close the board-settings modal. */
-  closeSettings(): void { this.setState({ settingsOpen: false }) }
+  closeSettings(): void { this.setState({ settingsOpen: false, storageNotice: undefined }) }
 
   /**
    * Replace board settings (0.5.0). The host broadcasts a settings-updated
@@ -586,6 +714,38 @@ export class BoardController {
       this.setState({ error: error instanceof Error ? error.message : String(error) })
       return false
     }
+  }
+
+  /** Validate a candidate host directory without changing the active store. */
+  async checkStorage(directory: string): Promise<boolean> {
+    try {
+      const storage = await this.client.checkStorage(directory)
+      this.setState({ storage, error: undefined })
+      return true
+    } catch (error) {
+      this.setState({ error: error instanceof Error ? error.message : String(error) })
+      return false
+    }
+  }
+
+  /** Atomically migrate all three stores and refresh the displayed location. */
+  async migrateStorage(directory: string): Promise<boolean> {
+    try {
+      const storage = await this.client.migrateStorage(directory)
+      // Success is surfaced as a dedicated notice (not the error banner);
+      // cleanup warnings render beneath it as warnings, never as errors.
+      this.setState({ storage, storageNotice: { path: storage.currentDirectory, warnings: storage.warnings }, error: undefined })
+      await this.refresh()
+      return true
+    } catch (error) {
+      this.setState({ error: error instanceof Error ? error.message : String(error) })
+      return false
+    }
+  }
+
+  /** Clear the settled migration notice (next user edit in the storage section). */
+  dismissStorageNotice(): void {
+    if (this.state.storageNotice !== undefined) this.setState({ storageNotice: undefined })
   }
 
   /** Clean one orphan worktree (⚙ panel); refreshes the diagnostics payload. */
@@ -622,7 +782,9 @@ export class BoardController {
         prompt: task.prompt.length > 0 ? task.prompt : undefined,
         execution: task.execution.mode === 'scheduled' && task.execution.cron !== undefined
           ? { mode: 'scheduled', cron: task.execution.cron }
-          : { mode: 'claim' },
+          : task.execution.mode === 'scheduled' && task.execution.runAt !== undefined && task.execution.runAt > Date.now()
+            ? { mode: 'scheduled', runAt: new Date(task.execution.runAt).toISOString() }
+            : { mode: 'claim' },
         model: task.model,
         isolation: task.isolation,
         ...(task.presetId !== undefined ? { presetId: task.presetId } : {}),
@@ -695,7 +857,9 @@ export class BoardController {
         urgency: task.urgency,
         execution: task.execution.mode === 'scheduled' && task.execution.cron !== undefined
           ? { mode: 'scheduled', cron: task.execution.cron }
-          : { mode: 'claim' },
+          : task.execution.mode === 'scheduled' && task.execution.runAt !== undefined
+            ? { mode: 'scheduled', runAt: new Date(task.execution.runAt).toISOString() }
+            : { mode: 'claim' },
         model: task.model,
         isolation: task.isolation,
         ...(task.presetId !== undefined ? { presetId: task.presetId } : {}),

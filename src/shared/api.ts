@@ -38,7 +38,18 @@ export type ApiResult<T> = ApiOk<T> | ApiFail
 // ---------------------------------------------------------------------------
 
 /** Full-state response (the reconnect baseline after an SSE gap). */
-export type StateResponse = TaskLedger
+export type QueueSummary = {
+  depth: number
+  dispatching: number
+  oldestQueuedAt?: number
+  oldestWaitMinutes?: number
+  maxConcurrent: number
+}
+
+export type StateResponse = TaskLedger & { capabilities?: { archiveSessions: boolean }; queue?: QueueSummary }
+
+/** Result of dropping every durable queue entry (board queue panel). */
+export type QueueClearResponse = { cleared: number }
 
 /**
  * Workspace listing for the UI pickers. `repoCount` (0.6.3): how many repos a
@@ -46,6 +57,8 @@ export type StateResponse = TaskLedger
  * worktree option shows the mirror badge when it exceeds 1.
  */
 export type WorkspaceView = { id: string; path: string; title: string; sessionCount: number; gitAvailable?: boolean; repoCount?: number }
+/** Sessions currently owned by one project and eligible for explicit reuse. */
+export type ProjectSessionView = { id: string; title?: string }
 
 /** Create-task request body (actor is always the GUI user). */
 export type CreateTaskBody = {
@@ -54,7 +67,7 @@ export type CreateTaskBody = {
   urgency: string
   description?: string
   prompt?: string
-  execution?: { mode?: string; cron?: string }
+  execution?: { mode?: string; cron?: string; runAt?: string | number; periodicCompletion?: 'rearm' | 'spawn'; reuseSessionId?: string; sessionReuseMode?: 'fresh' | 'reuse' }
   model?: TaskModel
   /** Code isolation for executions ('worktree' | 'none'); omitted = default. */
   isolation?: string
@@ -76,7 +89,7 @@ export type UpdateTaskBody = {
   blocked?: boolean
   /** Rebind the task to another project (GUI owner surface only). */
   workspaceId?: string
-  execution?: { mode?: string; cron?: string }
+  execution?: { mode?: string; cron?: string; runAt?: string | number; periodicCompletion?: 'rearm' | 'spawn'; reuseSessionId?: string; sessionReuseMode?: 'fresh' | 'reuse' }
   model?: TaskModel | null
   /** Change isolation; locked once the task has execution history. */
   isolation?: string
@@ -89,7 +102,10 @@ export type UpdateTaskBody = {
 }
 
 /** Move-task request body (ifVersion mandatory; the user MAY move to done). */
-export type MoveTaskBody = { ifVersion: number; status: string }
+export type MoveTaskBody = { ifVersion: number; status: string; archiveSessions?: boolean }
+
+export type SessionArchiveResult = { archived: string[]; failed: Array<{ sessionId: string; error: string }>; unsupported: string[] }
+export type MoveTaskResponse = TaskSummary & { sessionArchive?: SessionArchiveResult }
 
 /**
  * Quick-reject request body (card ✗ button): move back to todo plus an
@@ -100,6 +116,16 @@ export type RejectTaskBody = { ifVersion: number; body?: string }
 
 /** Comment request body. */
 export type CommentBody = { body: string }
+
+/** One content-addressed image uploaded outside the ledger. */
+export type AttachmentUpload = {
+  id: string
+  name: string
+  size: number
+  url: string
+  extension: 'png' | 'jpg' | 'gif' | 'webp'
+  mime: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'
+}
 
 /** Delete request body (purge=true physically removes a trashed task). */
 export type DeleteTaskBody = { ifVersion?: number; purge?: boolean }
@@ -145,6 +171,7 @@ export type DiagnosticsResponse = {
   tasks: number
   /** Executions currently marked `running`. */
   staleRunning: number
+  queue: QueueSummary
   /** Worktree directories whose task no longer exists in the ledger. */
   orphanWorktrees: OrphanWorktree[]
   /** Git workspaces whose .gitignore does not ignore the worktree dir. */
@@ -157,7 +184,7 @@ export type TaskTemplateSpec = {
   description?: string
   prompt?: string
   urgency?: string
-  execution?: { mode?: string; cron?: string }
+  execution?: { mode?: string; cron?: string; runAt?: string | number; periodicCompletion?: 'rearm' | 'spawn'; reuseSessionId?: string; sessionReuseMode?: 'fresh' | 'reuse' }
   model?: TaskModel
   isolation?: string
   presetId?: string
@@ -184,6 +211,22 @@ export type TemplatesResponse = { templates: TaskTemplate[] }
 /** Board-settings response (0.5.0; absent fields follow factory defaults). */
 export type SettingsResponse = BoardSettings
 
+/** Current host-side location of all durable taskboard data. */
+export type StorageStatus = {
+  currentDirectory: string
+  defaultDirectory: string
+  isDefault: boolean
+  configured: boolean
+  writable: boolean
+  assetCount: number
+  assetBytes: number
+  checkedDirectory?: string
+  error?: string
+}
+
+/** Completed storage relocation, including non-fatal old-file cleanup failures. */
+export type StorageMigrationResult = StorageStatus & { migrated: boolean; warnings: string[] }
+
 /** Update-board-settings request body (0.5.0; whole-object replace semantics). */
 export type UpdateSettingsBody = {
   /** Default code isolation for NEW tasks ('worktree' | 'none'). */
@@ -192,6 +235,14 @@ export type UpdateSettingsBody = {
   syncExternalSessions?: boolean
   /** Default permission preset for NEW tasks ('workspace-write' | 'read-only' | 'danger-full-access'). */
   defaultPermission?: string
+  /** Global simultaneous execution cap (1–100). */
+  maxConcurrent?: number
+  /** Offline missed-window threshold in whole minutes (1–1440). */
+  scheduleMissedAfterMinutes?: number
+  /** Drop queued work after this many minutes; 0 retains it indefinitely. */
+  queueMaxAgeMinutes?: number
+  /** Minimum milliseconds between scheduled session starts; defaults to 1000 and accepts 0 to disable throttling. */
+  dispatchIntervalMs?: number
 }
 
 /** Prompt completion item for skills and slash commands (0.5.5). */

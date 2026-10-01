@@ -17,6 +17,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { registerTaskboardRoutes } from '../src/host/routes.ts'
 import { TaskStore, type LedgerChange } from '../src/host/store.ts'
 import { TemplateStore } from '../src/host/templates.ts'
+import { AssetStore } from '../src/host/assets.ts'
+import type { StorageCoordinator } from '../src/host/storage.ts'
 import type { GitFace } from '../src/host/git.ts'
 import type { RepoScanner } from '../src/host/repos.ts'
 import type { WorkspaceFace } from '../src/host/tools.ts'
@@ -31,6 +33,8 @@ let store: InstanceType<typeof TaskStore>
 /** The live template store behind the forwarding face; swapped in beforeEach. */
 let templates: InstanceType<typeof TemplateStore>
 let cancelCalls: string[]
+/** Mutable queue-clear hook target (tests reassign the behavior). */
+let clearQueueImpl: () => Promise<number> = async () => 0
 let runCalls: Array<{ id: string; runOptions?: { reuseWorktree?: boolean } }>
 let dir: string
 /** Per-test store file counter (unique names keep a fresh store from ever
@@ -43,10 +47,14 @@ const WS_BASE: Array<{ id: string; path: string; title: string }> = [
   { id: 'ws-b', path: '/proj/b', title: 'B' },
 ]
 const wsList: Array<{ id: string; path: string; title: string }> = []
+const archivedSessionsHistory: string[] = []
 const workspaces: WorkspaceFace = {
   resolveByPath: async path => (path === '/proj/a' ? { id: 'ws-a' } : path === '/proj/b' ? { id: 'ws-b' } : undefined),
   get: id => wsList.find(w => w.id === id),
   list: () => wsList.slice(),
+  archiveSession: async sessionId => {
+    archivedSessionsHistory.push(sessionId)
+  },
 }
 
 /** Factory defaults for the swappable git behavior (reset in beforeEach). */
@@ -183,10 +191,17 @@ beforeAll(async () => {
     now: () => 5_000,
     run: async (id, runOptions) => { runCalls.push({ id, runOptions }); return { ok: true, executionId: 'e-x', sessionId: 's-x' } },
     cancel: async id => { cancelCalls.push(id); return { ok: true, executionId: 'e-x' } },
+    clearQueue: () => clearQueueImpl(),
     modelProviders: () => ['prov-a'],
     git: gitFace,
     scanner: scannerFace,
     templates: templatesFace as unknown as InstanceType<typeof TemplateStore>,
+    assets: new AssetStore(join(dir, 'assets')),
+    storage: {
+      status: async () => ({ currentDirectory: dir, defaultDirectory: dir, isDefault: true, configured: false, writable: true, assetCount: 0, assetBytes: 0 }),
+      check: async (directory: string) => ({ currentDirectory: dir, defaultDirectory: dir, isDefault: true, configured: false, writable: true, assetCount: 0, assetBytes: 0, checkedDirectory: directory }),
+      migrate: async (directory: string) => ({ currentDirectory: directory, defaultDirectory: dir, isDefault: false, configured: true, writable: true, assetCount: 0, assetBytes: 0, migrated: true, warnings: [] }),
+    } as unknown as StorageCoordinator,
     modelCatalog: async () => ({
       models: [{ provider: 'prov-a', model: 'model-a', name: 'Model A' }],
       presets: [{ id: 'standard', name: '标准模式' }],
@@ -214,6 +229,7 @@ beforeEach(async () => {
   )
   cancelCalls.length = 0
   runCalls.length = 0
+  archivedSessionsHistory.length = 0
   Object.assign(gitBehavior, freshGitBehavior())
   wsList.length = 0
   wsList.push(...WS_BASE.map(w => ({ ...w })))
@@ -236,12 +252,51 @@ async function post(path: string, body: unknown): Promise<{ status: number; json
 }
 
 describe('taskboard routes', () => {
+  it('exposes storage status, path checks, and migration', async () => {
+    const status = await (await fetch(`${base}/dsh-taskboard/storage`)).json()
+    expect(status.value.currentDirectory).toBe(dir)
+    const checked = await post('/dsh-taskboard/storage/check', { directory: 'D:\\board-data' })
+    expect(checked.json.value.checkedDirectory).toBe('D:\\board-data')
+    const migrated = await post('/dsh-taskboard/storage/migrate', { directory: 'D:\\board-data' })
+    expect(migrated.json.value).toMatchObject({ currentDirectory: 'D:\\board-data', migrated: true })
+  })
+
+  it('uploads and serves content-addressed images with strict headers', async () => {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3])
+    const uploaded = await fetch(`${base}/dsh-taskboard/assets`, {
+      method: 'POST',
+      headers: { 'content-type': 'image/png', 'x-dsh-taskboard-upload': '1' },
+      body: png,
+    })
+    expect(uploaded.status).toBe(201)
+    const body = await uploaded.json()
+    expect(body.value.url).toMatch(/^\/dsh-taskboard\/assets\/[a-f0-9]{64}\.png$/)
+
+    const served = await fetch(base + body.value.url)
+    expect(served.status).toBe(200)
+    expect(served.headers.get('content-type')).toBe('image/png')
+    expect(served.headers.get('x-content-type-options')).toBe('nosniff')
+    expect(Buffer.from(await served.arrayBuffer())).toEqual(png)
+  })
+
+  it('rejects upload CSRF, spoofed image types, and traversal-shaped reads', async () => {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    const noHeader = await fetch(`${base}/dsh-taskboard/assets`, { method: 'POST', headers: { 'content-type': 'image/png' }, body: png })
+    expect(noHeader.status).toBe(403)
+    const spoofed = await fetch(`${base}/dsh-taskboard/assets`, {
+      method: 'POST', headers: { 'content-type': 'image/jpeg', 'x-dsh-taskboard-upload': '1' }, body: png,
+    })
+    expect(spoofed.status).toBe(400)
+    expect((await fetch(`${base}/dsh-taskboard/assets/..%2Fpackage.json`)).status).toBe(404)
+  })
+
   it('serves an empty state baseline', async () => {
     const res = await fetch(`${base}/dsh-taskboard/state`)
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body.ok).toBe(true)
     expect(body.value.tasks).toEqual([])
+    expect(body.value.queue).toEqual({ depth: 0, dispatching: 0, maxConcurrent: 0 })
   })
 
   it('lists workspaces for the picker (with git availability)', async () => {
@@ -251,6 +306,34 @@ describe('taskboard routes', () => {
       { id: 'ws-a', path: '/proj/a', title: 'A', sessionCount: 0, gitAvailable: false, repoCount: 0 },
       { id: 'ws-b', path: '/proj/b', title: 'B', sessionCount: 0, gitAvailable: false, repoCount: 0 },
     ])
+  })
+
+  it('lists only project sessions and rejects a selected session from another project', async () => {
+    workspaces.sessionIds = id => id === 'ws-a' ? ['session-a'] : id === 'ws-b' ? ['session-b'] : undefined
+    try {
+      const listed = await (await fetch(`${base}/dsh-taskboard/project-sessions?workspaceId=ws-a`)).json()
+      expect(listed.value.sessions).toEqual([{ id: 'session-a' }])
+      expect((await fetch(`${base}/dsh-taskboard/project-sessions?workspaceId=missing`)).status).toBe(404)
+      const invalid = await post('/dsh-taskboard/tasks', {
+        title: 'Wrong session', workspaceId: 'ws-a', urgency: 'normal',
+        execution: { mode: 'scheduled', cron: '* * * * *', reuseSessionId: 'session-b' },
+      })
+      expect(invalid.status).toBe(400)
+      const created = await post('/dsh-taskboard/tasks', {
+        title: 'Selected session', workspaceId: 'ws-a', urgency: 'normal',
+        execution: { mode: 'scheduled', cron: '* * * * *', reuseSessionId: 'session-a' },
+      })
+      expect(created.status).toBe(201)
+      expect(store.get(created.json.value.id)!.execution.reuseSessionId).toBe('session-a')
+      const fresh = await post('/dsh-taskboard/tasks', {
+        title: 'Fresh by default', workspaceId: 'ws-a', urgency: 'normal',
+        execution: { mode: 'scheduled', cron: '* * * * *' },
+      })
+      expect(fresh.status).toBe(201)
+      expect(store.get(fresh.json.value.id)!.execution.sessionReuseMode).toBe('fresh')
+    } finally {
+      workspaces.sessionIds = undefined
+    }
   })
 
   it('workspaces repoCount (0.6.3): root+nested and pure-container shapes enable worktree and feed the mirror badge', async () => {
@@ -305,6 +388,8 @@ describe('taskboard routes', () => {
     expect(review.json.value.status).toBe('in_review')
     const done = await post(`/dsh-taskboard/tasks/${id}/move`, { ifVersion: 3, status: 'done' })
     expect(done.json.value.status).toBe('done')
+    const reopened = await post(`/dsh-taskboard/tasks/${id}/move`, { ifVersion: 4, status: 'todo' })
+    expect(reopened.json.value.status).toBe('todo')
   })
 
   it('rejects stale versions with 409', async () => {
@@ -349,7 +434,7 @@ describe('taskboard routes', () => {
     expect(full3.value.status).toBe('in_review')
     expect(full3.value.comments.length).toBe(1)
 
-    // Illegal source (done → todo is not in the state machine): 400.
+    // Reject is specifically an in_review action; done reopens through move.
     await post(`/dsh-taskboard/tasks/${id}/move`, { ifVersion: 9, status: 'done' })
     const illegal = await post(`/dsh-taskboard/tasks/${id}/reject`, { ifVersion: 10 })
     expect(illegal.status).toBe(400)
@@ -411,6 +496,94 @@ describe('taskboard routes', () => {
     expect(after.value.title).toBe('已归档')
     expect(after.value.version).toBe(full.value.version)
     expect(after.value.comments).toEqual([])
+  })
+
+  it('reports partial archiving and retries without moving the archived card again', async () => {
+    const saved = workspaces.archiveSession
+    try {
+      const created = await post('/dsh-taskboard/tasks', { title: 'Archive retry', workspaceId: 'ws-a', urgency: 'normal' })
+      const id = created.json.value.id as string
+      expect((await post(`/dsh-taskboard/tasks/${id}/archive-sessions`, {})).status).toBe(400)
+      await store.mutate('execution-recorded', ledger => {
+        const task = ledger.tasks.find(t => t.id === id)!
+        task.status = 'done'
+        task.createdBy = { kind: 'agent', sessionId: 'session-planner' }
+        task.executions.push(...['session-one', 'session-two'].map((sessionId, i) => ({ id: `e-${i}`, trigger: 'manual' as const, outcome: 'succeeded' as const, startedAt: 0, sessionId })))
+        return [task]
+      })
+      workspaces.archiveSession = async id => { if (id === 'session-two') throw new Error('disk failure'); archivedSessionsHistory.push(id) }
+      const moved = await post(`/dsh-taskboard/tasks/${id}/move`, { ifVersion: store.get(id)!.version, status: 'archived', archiveSessions: true })
+      expect(moved.json.value.sessionArchive).toEqual({ archived: ['session-one'], failed: [{ sessionId: 'session-two', error: 'disk failure' }], unsupported: [] })
+      const version = store.get(id)!.version
+      workspaces.archiveSession = saved
+      const retried = await post(`/dsh-taskboard/tasks/${id}/archive-sessions`, {})
+      expect(retried.json.value).toEqual({ archived: ['session-one', 'session-two'], failed: [], unsupported: [] })
+      expect(store.get(id)!.version).toBe(version)
+      expect(archivedSessionsHistory).not.toContain('session-planner')
+      workspaces.archiveSession = undefined
+      expect((await post(`/dsh-taskboard/tasks/${id}/archive-sessions`, {})).json.value.unsupported).toEqual(['session-one', 'session-two'])
+    } finally { workspaces.archiveSession = saved }
+  })
+
+  it('moving to archived with archiveSessions: true archives associated sessions', async () => {
+    const created = await post('/dsh-taskboard/tasks', { title: '待归档', workspaceId: 'ws-a', urgency: 'normal' })
+    const id = created.json.value.id as string
+
+    // Simulate task having an execution session and being marked done
+    await store.mutate('execution-recorded', ledger => {
+      const target = ledger.tasks.find(t => t.id === id)!
+      target.status = 'done'
+      target.version += 1
+      target.executions.push({
+        id: 'e-1',
+        trigger: 'manual',
+        startedAt: 100,
+        outcome: 'succeeded',
+        sessionId: 'session-to-archive-123',
+      })
+      return [target]
+    })
+
+    const taskDone = store.snapshot().tasks.find(t => t.id === id)!
+    expect(taskDone.status).toBe('done')
+
+    // Move to archived with archiveSessions: false -> session NOT archived
+    const resNoArchive = await post(`/dsh-taskboard/tasks/${id}/move`, {
+      status: 'archived',
+      ifVersion: taskDone.version,
+      archiveSessions: false,
+    })
+    expect(resNoArchive.status).toBe(200)
+    expect(resNoArchive.json.value.status).toBe('archived')
+    expect(archivedSessionsHistory).toEqual([])
+
+    // Now test with archiveSessions: true on a second task
+    const created2 = await post('/dsh-taskboard/tasks', { title: '待归档带会话', workspaceId: 'ws-a', urgency: 'normal' })
+    const id2 = created2.json.value.id as string
+
+    await store.mutate('execution-recorded', ledger => {
+      const target = ledger.tasks.find(t => t.id === id2)!
+      target.status = 'done'
+      target.version += 1
+      target.executions.push({
+        id: 'e-2',
+        trigger: 'manual',
+        startedAt: 200,
+        outcome: 'succeeded',
+        sessionId: 'session-archive-me-456',
+      })
+      return [target]
+    })
+
+    const task2Done = store.snapshot().tasks.find(t => t.id === id2)!
+    const resArchive = await post(`/dsh-taskboard/tasks/${id2}/move`, {
+      status: 'archived',
+      ifVersion: task2Done.version,
+      archiveSessions: true,
+    })
+    expect(resArchive.status).toBe(200)
+    expect(resArchive.json.value.status).toBe('archived')
+    expect(archivedSessionsHistory).toEqual(['session-archive-me-456'])
   })
 
   it('POST /tasks rejects non-initial statuses (backlog/todo only)', async () => {
@@ -693,6 +866,20 @@ describe('taskboard routes', () => {
     }
   })
 
+  it('POST /queue/clear: reports the cleared count; hook errors surface as structured failures', async () => {
+    clearQueueImpl = async () => 3
+    const ok = await post('/dsh-taskboard/queue/clear', {})
+    expect(ok.status).toBe(200)
+    expect(ok.json).toEqual({ ok: true, value: { cleared: 3 } })
+
+    clearQueueImpl = async () => { throw new Error('Error: not_found: no scheduler') }
+    const bad = await post('/dsh-taskboard/queue/clear', {})
+    expect(bad.status).toBe(404)
+    expect(bad.json.ok).toBe(false)
+    clearQueueImpl = async () => 0
+  })
+
+
   it('run action passes reuse through to the execution service (续跑)', async () => {
     const created = await post('/dsh-taskboard/tasks', { title: 'Reuse me', workspaceId: 'ws-a', urgency: 'normal' })
     const id = created.json.value.id as string
@@ -796,6 +983,26 @@ describe('taskboard routes 0.4.0 (checklist / templates / import / diff)', () =>
     // Bad payload rejected.
     const bad = await post('/dsh-taskboard/tasks', { title: 'x', workspaceId: 'ws-a', urgency: 'normal', checklist: [1] })
     expect(bad.status).toBe(400)
+  })
+
+  it('persists a periodic completion policy on tasks and templates', async () => {
+    const created = await post('/dsh-taskboard/tasks', {
+      title: '自动续跑', workspaceId: 'ws-a', urgency: 'normal',
+      execution: { mode: 'scheduled', cron: '0 9 * * *', periodicCompletion: 'rearm' },
+    })
+    expect(created.status).toBe(201)
+    const id = created.json.value.id as string
+    expect(store.get(id)!.execution.periodicCompletion).toBe('rearm')
+    const updated = await post(`/dsh-taskboard/tasks/${id}/update`, {
+      ifVersion: 1, execution: { mode: 'scheduled', cron: '0 9 * * *', periodicCompletion: 'spawn' },
+    })
+    expect(updated.status).toBe(200)
+    expect(store.get(id)!.execution.periodicCompletion).toBe('spawn')
+    const template = await post('/dsh-taskboard/templates', {
+      name: '自动续跑模板', task: { execution: { mode: 'scheduled', cron: '0 9 * * *', periodicCompletion: 'spawn' } },
+    })
+    expect(template.status).toBe(201)
+    expect(template.json.value.task.execution.periodicCompletion).toBe('spawn')
   })
 
   // ------------------------------------------------------------- templates
@@ -946,14 +1153,14 @@ describe('taskboard routes 0.5.0 (board settings → default isolation)', () => 
     const badType = await post('/dsh-taskboard/settings/update', { defaultIsolation: 42 })
     expect(badType.status).toBe(400)
 
-    const ok = await post('/dsh-taskboard/settings/update', { defaultIsolation: 'worktree' })
+    const ok = await post('/dsh-taskboard/settings/update', { defaultIsolation: 'worktree', maxConcurrent: 8, scheduleMissedAfterMinutes: 15 })
     expect(ok.status).toBe(200)
-    expect(ok.json.value).toEqual({ defaultIsolation: 'worktree' })
+    expect(ok.json.value).toEqual({ defaultIsolation: 'worktree', maxConcurrent: 8, scheduleMissedAfterMinutes: 15 })
 
     const after = await (await fetch(`${base}/dsh-taskboard/settings`)).json()
-    expect(after.value).toEqual({ defaultIsolation: 'worktree' })
+    expect(after.value).toEqual({ defaultIsolation: 'worktree', maxConcurrent: 8, scheduleMissedAfterMinutes: 15 })
     const state = await (await fetch(`${base}/dsh-taskboard/state`)).json()
-    expect(state.value.settings).toEqual({ defaultIsolation: 'worktree' })
+    expect(state.value.settings).toEqual({ defaultIsolation: 'worktree', maxConcurrent: 8, scheduleMissedAfterMinutes: 15 })
   })
 
   it('create materializes the board default on omitted isolation; explicit wins; earlier tasks unaffected', async () => {

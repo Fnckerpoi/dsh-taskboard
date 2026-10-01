@@ -1,3 +1,4 @@
+import { archiveTaskSessions } from './archive-sessions.ts'
 /**
  * /dsh-taskboard routes on the shared DSH webserver: a JSON API for the
  * GUI's human operations (create/update/move/comment/delete — actor `user`,
@@ -40,12 +41,16 @@ import {
   type TaskLedger,
   type TaskModel,
   type TaskRecord,
+  type SystemCommentRow,
 } from '../shared/protocol.ts'
 import { WORKTREE_DIR, worktreePathOf, type GitFace } from './git.ts'
 import { removeMirror, repoMainPath } from './isolation.ts'
 import { createRepoScanner, type RepoScanner } from './repos.ts'
+import { activeHostLocale } from './locale.ts'
 import type { CatalogModelItem, CatalogPresetItem, MergeRepoResult, TaskTemplate } from '../shared/api.ts'
 import type { TemplateStore } from './templates.ts'
+import { MAX_ASSET_BYTES, type AssetStore } from './assets.ts'
+import type { StorageCoordinator } from './storage.ts'
 import { ROUTE_PREFIX, SSE_PATH, type ApiFail, type ApiResult } from '../shared/api.ts'
 import type { TaskStore } from './store.ts'
 import { ERR, ToolError } from './tools.ts'
@@ -61,6 +66,7 @@ const MAX_BODY_BYTES = 5 * 1024 * 1024
 const TASK_DIFF_RE = new RegExp(`^${ROUTE_PREFIX}/tasks/([^/]+)/diff$`)
 const TASK_RE = new RegExp(`^${ROUTE_PREFIX}/tasks/([^/]+)$`)
 const TASK_ACTION_RE = new RegExp(`^${ROUTE_PREFIX}/tasks/([^/]+)/([\\w-]+)$`)
+const ASSET_RE = new RegExp(`^${ROUTE_PREFIX}/assets/([a-f0-9]{64}\\.(?:png|jpg|gif|webp))$`)
 
 /** How long a workspace git-detection result stays cached (fail-soft). */
 const GIT_DETECT_TTL_MS = 60_000
@@ -73,6 +79,10 @@ export interface TaskboardRoutesOptions {
   store: TaskStore
   workspaces: RoutesWorkspaceFace
   now: () => number
+  /** Current scheduler concurrency limit, for queue observability only. */
+  maxConcurrent?: () => number
+  /** Drop every durable queue entry (board queue panel); absent → 501. */
+  clearQueue?: () => Promise<number>
   /** Manual-run hook (the execution service); absent → 501. Options carry `reuseWorktree` (续跑). */
   run?: (taskId: string, options?: { reuseWorktree?: boolean }) => Promise<{ ok: true; executionId: string; sessionId: string } | { ok: false; error: string }>
   /** Cancel hook (the execution service); absent → 501. */
@@ -88,6 +98,12 @@ export interface TaskboardRoutesOptions {
   scanner?: RepoScanner
   /** Task-template store (0.4.0); absent → 501 on template actions. */
   templates?: TemplateStore
+  /** Durable image attachment store (0.7.0); absent → attachment routes unavailable. */
+  assets?: AssetStore
+  /** Configurable data-directory coordinator (0.7.0). */
+  storage?: StorageCoordinator
+  /** Initial storage/ledger readiness barrier. */
+  ready?: () => Promise<void>
   /** Prompt completions face (0.5.5; dynamically discovers skills & commands). */
   promptCompletions?: () => Promise<{
     skills?: Array<{ name: string; description?: string }>
@@ -127,7 +143,7 @@ function normalizeTemplateSpec(raw: unknown, now: number): TaskTemplate['task'] 
   if (presetId !== undefined && presetId.trim().length > 0) spec.presetId = presetId.trim()
   if (permission !== undefined && permission.trim().length > 0) spec.permission = asPermission(permission)
   if (e.execution !== undefined) {
-    spec.execution = normalizeExecution(e.execution as { mode?: string; cron?: string }, now)
+    spec.execution = normalizeExecution(e.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown }, now)
   }
   if (e.model !== undefined) spec.model = normalizeModel(e.model)
   if (e.checklist !== undefined) {
@@ -189,6 +205,19 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown> |
   }
 }
 
+/** Read one bounded binary upload without ever buffering beyond the file cap. */
+async function readBytes(req: IncomingMessage, limit: number): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  let total = 0
+  for await (const chunk of req) {
+    const bytes = chunk as Buffer
+    total += bytes.length
+    if (total > limit) throw new Error('body too large')
+    chunks.push(bytes)
+  }
+  return Buffer.concat(chunks)
+}
+
 /** String field accessor (null when absent/not a string). */
 function str(body: Record<string, unknown>, key: string): string | null {
   const v = body[key]
@@ -246,6 +275,26 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
   const { store, workspaces } = options
   const subscribers = new Set<ServerResponse>()
   let heartbeat: NodeJS.Timeout | undefined
+
+  const queueSummary = (ledger: TaskLedger) => {
+    let depth = 0
+    let dispatching = 0
+    let oldestQueuedAt: number | undefined
+    for (const task of ledger.tasks) {
+      if (task.execution.queuedRunAt !== undefined) {
+        depth += 1
+        if (task.execution.queuedAt !== undefined && (oldestQueuedAt === undefined || task.execution.queuedAt < oldestQueuedAt)) oldestQueuedAt = task.execution.queuedAt
+      }
+      if (task.execution.dispatchingRunAt !== undefined) dispatching += 1
+    }
+    const now = options.now()
+    return {
+      depth,
+      dispatching,
+      ...(oldestQueuedAt === undefined ? {} : { oldestQueuedAt, oldestWaitMinutes: Math.max(0, Math.floor((now - oldestQueuedAt) / 60_000)) }),
+      maxConcurrent: options.maxConcurrent?.() ?? 0,
+    }
+  }
 
   /** R4③: a cleanup/purge target must resolve INSIDE <ws>/.dsh-worktrees — string joining alone is never trusted with an rm. */
   const insideWorktreeScope = (wsPath: string, target: string): boolean => {
@@ -316,10 +365,15 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
     } catch { /* fail-soft → false */ }
     // gitignore 建议 (plan §3.2): suggest (never write) ignoring our
     // worktree directory, once per workspace per host run. Root repos only.
+    // The line is localized from the DSH locale preference (see host/locale.ts).
     if (rootRepo && !gitHinted.has(path)) {
       gitHinted.add(path)
       if (await gitignoreMissing(path)) {
-        console.info(`[dsh-taskboard] 建议在 ${path}/.gitignore 加入一行 ${WORKTREE_DIR}/ 以隐藏任务 worktree 目录（不会自动修改）`)
+        const file = `${path}/.gitignore`
+        const hint = activeHostLocale(ctx) === 'zh'
+          ? `建议在 ${file} 加入一行 ${WORKTREE_DIR}/ 以隐藏任务 worktree 目录（不会自动修改）`
+          : `suggests adding one line to ${file}: ${WORKTREE_DIR}/ to hide the task worktree directory (no automatic edits)`
+        console.info(`[dsh-taskboard] ${hint}`)
       }
     }
     // The nested scan always runs: repoCount needs it even when the root
@@ -370,9 +424,29 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
 
       // ---------------------------------------------------------------- GET
       if (req.method === 'GET') {
+        if (pathname === `${ROUTE_PREFIX}/storage`) {
+          if (options.storage === undefined) { res.writeHead(501); res.end(); return }
+          json(res, { ok: true, value: await options.storage.status() })
+          return
+        }
+        await options.ready?.()
+        const assetMatch = pathname.match(ASSET_RE)
+        if (assetMatch !== null) {
+          const asset = await options.assets?.read(assetMatch[1]!)
+          if (asset === undefined) { res.writeHead(404); res.end(); return }
+          res.writeHead(200, {
+            'content-type': asset.mime,
+            'content-length': asset.bytes.length,
+            'cache-control': 'public, max-age=31536000, immutable',
+            'x-content-type-options': 'nosniff',
+          })
+          res.end(asset.bytes)
+          return
+        }
         if (pathname === `${ROUTE_PREFIX}/state`) {
           await store.load()
-          json(res, { ok: true, value: store.snapshot() })
+          const ledger = store.snapshot()
+          json(res, { ok: true, value: { ...ledger, capabilities: { archiveSessions: typeof workspaces.archiveSession === 'function' }, queue: queueSummary(ledger) } })
           return
         }
         if (pathname === `${ROUTE_PREFIX}/workspaces`) {
@@ -384,8 +458,19 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
           })
           return
         }
+        if (pathname === `${ROUTE_PREFIX}/project-sessions`) {
+          const workspaceId = url.searchParams.get('workspaceId') ?? ''
+          if (workspaces.get(workspaceId) === undefined) {
+            const f = fail('not_found', 'unknown workspace')
+            json(res, f.res, f.status)
+            return
+          }
+          json(res, { ok: true, value: { sessions: (workspaces.sessionIds?.(workspaceId) ?? []).map(id => ({ id })) } })
+          return
+        }
         if (pathname === `${ROUTE_PREFIX}/diagnostics`) {
           const ledger = store.snapshot()
+          const queue = queueSummary(ledger)
           let staleRunning = 0
           for (const t of ledger.tasks) {
             for (const e of t.executions) if (e.outcome === 'running') staleRunning += 1
@@ -396,6 +481,7 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
               revision: ledger.revision,
               tasks: ledger.tasks.length,
               staleRunning,
+              queue,
               orphanWorktrees: await listOrphanWorktrees(),
               gitIgnoreSuggestions: await listGitignoreSuggestions(),
             },
@@ -519,6 +605,34 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
         res.end()
         return
       }
+      // Content-addressed image upload. The custom header makes this a
+      // non-simple cross-origin request, preserving the JSON routes' CSRF fence.
+      if (pathname === `${ROUTE_PREFIX}/assets`) {
+        await options.ready?.()
+        if (options.assets === undefined) {
+          const f = fail('invalid_input', 'image attachments unavailable')
+          json(res, f.res, 501)
+          return
+        }
+        if (req.headers['x-dsh-taskboard-upload'] !== '1') {
+          const f = fail('forbidden', 'missing upload header')
+          json(res, f.res, 403)
+          return
+        }
+        const declaredMime = String(req.headers['content-type'] ?? '').split(';', 1)[0]!.trim().toLowerCase()
+        try {
+          const bytes = await readBytes(req, MAX_ASSET_BYTES)
+          await options.assets.cleanup(JSON.stringify(store.snapshot()))
+          const asset = await options.assets.put(bytes, declaredMime)
+          json(res, { ok: true, value: asset }, 201)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          const status = message.includes('1..') ? 413 : message.includes('quota') ? 507 : 400
+          const f = fail('invalid_input', message)
+          json(res, f.res, status)
+        }
+        return
+      }
       // CSRF fence: cross-site simple requests cannot set application/json.
       const contentType = req.headers['content-type'] ?? ''
       if (!contentType.toLowerCase().startsWith('application/json')) {
@@ -540,6 +654,29 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
         return
       }
 
+      // Storage location is bootstrap metadata outside the ledger. Keep it on
+      // separate routes so JSON imports and whole-ledger replacement cannot
+      // redirect host filesystem writes.
+      if (pathname === `${ROUTE_PREFIX}/storage/check` || pathname === `${ROUTE_PREFIX}/storage/migrate`) {
+        if (options.storage === undefined) {
+          const f = fail('invalid_input', 'storage configuration unavailable')
+          json(res, f.res, 501)
+          return
+        }
+        try {
+          const directory = str(body, 'directory') ?? ''
+          const value = pathname.endsWith('/check')
+            ? await options.storage.check(directory)
+            : await options.storage.migrate(directory)
+          json(res, { ok: true, value })
+        } catch (error) {
+          const f = fail('invalid_input', error instanceof Error ? error.message : String(error))
+          json(res, f.res, f.status)
+        }
+        return
+      }
+      await options.ready?.()
+
       // ------------------------------------------------- POST /tasks (create)
       if (pathname === `${ROUTE_PREFIX}/tasks`) {
         try {
@@ -551,7 +688,17 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
           if (status !== 'backlog' && status !== 'todo') {
             throw new Error('Error: invalid_transition: a new task must start as backlog or todo')
           }
-          const execution = normalizeExecution((body.execution as { mode?: string; cron?: string } | undefined) ?? {}, options.now())
+          const execution = normalizeExecution((body.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown; sessionReuseMode?: unknown } | undefined) ?? {}, options.now())
+          // New API-created scheduled tasks follow the same explicit default
+          // as the form: create a fresh conversation on each trigger. Only
+          // pre-existing ledgers with an omitted policy retain #26 behavior.
+          if (execution.mode === 'scheduled' && execution.cron !== undefined
+            && execution.reuseSessionId === undefined && execution.sessionReuseMode === undefined) {
+            execution.sessionReuseMode = 'fresh'
+          }
+          if (execution.reuseSessionId !== undefined && !workspaces.sessionIds?.(workspaceId)?.includes(execution.reuseSessionId)) {
+            throw new Error('Error: invalid_input: selected session is not available in this workspace')
+          }
           const model = body.model === undefined ? undefined : checkModel(body.model, options.modelProviders)
           const isolationRaw = str(body, 'isolation')
           // 0.5.0: an omitted isolation is MATERIALIZED from the board
@@ -615,6 +762,12 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
         try {
           const task = store.get(id)
           if (task === undefined) throw new Error('Error: not_found: no such task')
+          if (action === 'archive-sessions') {
+            if (task.trashedAt !== undefined || task.status !== 'archived') throw new Error('Error: invalid_transition: only archived live tasks can retry session archiving')
+            const result = await archiveTaskSessions(task, workspaces.archiveSession)
+            json(res, { ok: true, value: result })
+            return
+          }
           if (action === 'update') {
             const ifVersion = num(body, 'ifVersion')
             if (ifVersion === undefined || ifVersion === null) throw new Error('Error: version_conflict: ifVersion required')
@@ -641,7 +794,20 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
               }
               if (typeof body.blocked === 'boolean') next.blocked = body.blocked
               // The GUI (task owner surface) may edit model/execution; null clears the model.
-              if (body.execution !== undefined) next.execution = normalizeExecution(body.execution as { mode?: string; cron?: string }, options.now())
+              if (body.execution !== undefined) {
+                const previousExecution = next.execution
+                next.execution = normalizeExecution(body.execution as { mode?: string; cron?: string; runAt?: unknown; periodicCompletion?: unknown; reuseSessionId?: unknown; sessionReuseMode?: unknown }, options.now())
+                // The client never owns the learned continuation pointer. Keep
+                // it when the task remains on the same auto-reuse policy.
+                if (next.execution.reuseSessionId === undefined && next.execution.sessionReuseMode === 'reuse'
+                  && previousExecution.reuseSessionId === undefined && previousExecution.sessionReuseMode !== 'fresh') {
+                  next.execution.autoReuseSessionId = previousExecution.autoReuseSessionId
+                  next.execution.autoReuseSessionKey = previousExecution.autoReuseSessionKey
+                }
+              }
+              if (next.execution.reuseSessionId !== undefined && !workspaces.sessionIds?.(next.workspaceId)?.includes(next.execution.reuseSessionId)) {
+                throw new Error('Error: invalid_input: selected session is not available in this workspace')
+              }
               if (body.model === null) next.model = undefined
               else if (body.model !== undefined) next.model = checkModel(body.model, options.modelProviders)
               // Isolation may change only before the first execution (分支与基线
@@ -678,13 +844,16 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
           if (action === 'move') {
             const ifVersion = num(body, 'ifVersion')
             const status = str(body, 'status') ?? ''
+            const archiveSessions = body.archiveSessions === true
             if (ifVersion === undefined || ifVersion === null) throw new Error('Error: version_conflict: ifVersion required')
             const to = asStatus(status)
             let next: TaskRecord | undefined
+            let beforeTask: TaskRecord | undefined
             await store.mutate('task-moved', ledger => {
               const { index, task } = liveTaskAt(ledger, id)
               if (ifVersion !== task.version) throw new Error(`Error: version_conflict: stale version ${ifVersion} (current ${task.version})`)
               if (!canTransition(task.status, to)) throw new Error(`Error: invalid_transition: illegal transition ${task.status} → ${to}`)
+              beforeTask = task
               next = structuredClone(task)
               next.status = to
               next.version = task.version + 1
@@ -696,7 +865,10 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
               ledger.tasks[index] = next
               return [next]
             })
-            json(res, { ok: true, value: summarize(next!) })
+            const sessionArchive = to === 'archived' && archiveSessions
+              ? await archiveTaskSessions(beforeTask ?? next!, workspaces.archiveSession)
+              : undefined
+            json(res, { ok: true, value: { ...summarize(next!), ...(sessionArchive !== undefined ? { sessionArchive } : {}) } })
             return
           }
           if (action === 'reject') {
@@ -709,6 +881,7 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
             await store.mutate('task-moved', ledger => {
               const { index, task } = liveTaskAt(ledger, id)
               if (ifVersion !== task.version) throw new Error(`Error: version_conflict: stale version ${ifVersion} (current ${task.version})`)
+              if (task.status !== 'in_review') throw new Error(`Error: invalid_transition: reject requires in_review (current ${task.status})`)
               if (!canTransition(task.status, 'todo')) throw new Error(`Error: invalid_transition: illegal transition ${task.status} → todo`)
               next = structuredClone(task)
               next.status = 'todo'
@@ -909,11 +1082,21 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
             }
             // R1: the git merges above are slow — re-find the FRESH task inside
             // the mutation so a concurrent comment is never overwritten.
-            const pushComment = (body: string): Promise<void> =>
+            const pushComment = (body: string, system?: { key: string; params?: Record<string, string>; rows?: SystemCommentRow[] }): Promise<void> =>
               store.mutate('comment-added', ledger => {
                 const { index, task: fresh } = liveTaskAt(ledger, id)
                 const next = structuredClone(fresh)
-                next.comments.push({ id: newCommentId(), body: normalizeBody(body), version: 1, createdAt: options.now() })
+                next.comments.push({
+                  id: newCommentId(),
+                  body: normalizeBody(body),
+                  ...(system !== undefined ? {
+                    systemKey: system.key,
+                    ...(system.params !== undefined ? { systemParams: system.params } : {}),
+                    ...(system.rows !== undefined ? { systemRows: system.rows } : {}),
+                  } : {}),
+                  version: 1,
+                  createdAt: options.now(),
+                })
                 next.version = fresh.version + 1
                 next.updatedAt = options.now()
                 ledger.tasks[index] = next
@@ -930,7 +1113,7 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
               if (root.outcome === 'failed') {
                 throw new Error(`Error: invalid_input: ${root.error ?? '合并失败'}`)
               }
-              await pushComment(`[系统] 分支 ${root.branch} 已合并到主工作区（--no-ff）。`)
+              await pushComment(`[系统] 分支 ${root.branch} 已合并到主工作区（--no-ff）。`, { key: 'sys.mergeSingle', params: { branch: root.branch } })
               json(res, { ok: true, value: { merged: true, branch: root.branch } })
               return
             }
@@ -942,7 +1125,10 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
                 ? `${labelOf(r.repo)} ✓ 已合并`
                 : r.outcome === 'noop' ? `${labelOf(r.repo)} ⟲ 无新提交` : `${labelOf(r.repo)} ✗ ${(r.error ?? '合并失败').slice(0, 150)}`)
               .join('；')
-            await pushComment(`[系统] 分支已按仓库合并（--no-ff）：${summary}`)
+            await pushComment(`[系统] 分支已按仓库合并（--no-ff）：${summary}`, {
+              key: 'sys.mergeMulti',
+              rows: results.map(r => ({ repo: r.repo, outcome: r.outcome, ...(r.error !== undefined ? { error: r.error.slice(0, 150) } : {}) })),
+            })
             json(res, {
               ok: true,
               value: {
@@ -1003,6 +1189,23 @@ export function registerTaskboardRoutes(ctx: Context, options: TaskboardRoutesOp
           }
           const f = fail('not_found', `unknown action ${action}`)
           json(res, f.res, f.status)
+        } catch (error) {
+          const f = toFail(error)
+          json(res, f.res, f.status)
+        }
+        return
+      }
+
+      // ----------------------------------- POST /queue/clear (board queue panel)
+      if (pathname === `${ROUTE_PREFIX}/queue/clear`) {
+        if (options.clearQueue === undefined) {
+          const f = fail('invalid_input', 'scheduler queue clear unavailable')
+          json(res, f.res, 501)
+          return
+        }
+        try {
+          const cleared = await options.clearQueue()
+          json(res, { ok: true, value: { cleared } })
         } catch (error) {
           const f = toFail(error)
           json(res, f.res, f.status)

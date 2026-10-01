@@ -1,3 +1,5 @@
+import type { SessionArchiveResult } from '../shared/api.ts'
+import { archiveTaskSessions } from './archive-sessions.ts'
 /**
  * The ten `taskboard_*` agent tools. All writes require a calling agent
  * session (ownership audit), carry optimistic-version checks, and enforce
@@ -25,11 +27,13 @@ import { defineTool } from './sdk.ts'
 import {
   MAX_CHECKLIST_ITEMS,
   asIsolation,
+  asPermission,
   asStatus,
   asUrgency,
   canTransition,
   checklistFromTexts,
   defaultIsolationOf,
+  defaultPermissionOf,
   effectivePrompt,
   isClaim,
   isClaimedBy,
@@ -85,7 +89,7 @@ function taskDetail(t: TaskRecord & { effectivePrompt?: string }): string {
   const lines: string[] = [
     `任务 ${t.id} 「${t.title}」`,
     `状态: ${t.status} (v${t.version}) · 紧急度: ${t.urgency} · 项目: ${t.workspaceId}${t.blocked ? ' · 受阻' : ''}`,
-    `执行方式: ${t.execution.mode}${t.execution.cron !== undefined ? ` cron=${t.execution.cron}` : ''}`,
+    `执行方式: ${t.execution.mode}${t.execution.cron !== undefined ? ` 定期 cron=${t.execution.cron}` : ''}${t.execution.runAt !== undefined ? ` 定时(一次) runAt=${new Date(t.execution.runAt).toISOString()}` : ''}`,
     `隔离: ${t.isolation === 'none' ? '关闭（原目录执行）' : 'Git Worktree'}${t.branch !== undefined ? `（分支 ${t.branch}）` : ''}${t.branches !== undefined ? `（多仓库镜像 ${Object.keys(t.branches).length + (t.branch !== undefined ? 1 : 0)} 个仓库）` : ''}`,
   ]
   const holder = isClaimedBy(t)
@@ -136,6 +140,7 @@ function taskDetail(t: TaskRecord & { effectivePrompt?: string }): string {
 
 /** Stable error codes surfaced at the head of tool error messages. */
 export const ERR = {
+  notReady: 'taskboard_not_ready',
   notFound: 'not_found',
   versionConflict: 'version_conflict',
   workspaceMismatch: 'workspace_mismatch',
@@ -162,6 +167,10 @@ export interface WorkspaceFace {
   get(id: string): { id: string; path: string; title: string } | undefined
   /** List all workspaces. */
   list(): Array<{ id: string; path: string; title: string }>
+  /** Unarchived sessions owned by this project, in registry order. */
+  sessionIds?(workspaceId: string): string[] | undefined
+  /** Archive one session durably (when supported by runtime workspaceRegistry). */
+  archiveSession?(sessionId: string): Promise<void>
 }
 
 /** Adapt the real registry to the narrow face. */
@@ -178,6 +187,15 @@ export function workspaceFace(registry: WorkspaceRegistry): WorkspaceFace {
       return ws === undefined ? undefined : { id: ws.id, path: ws.path, title: ws.title }
     },
     list: () => registry.list().map(ws => ({ id: ws.id, path: ws.path, title: ws.title })),
+    sessionIds: id => {
+      const ws = registry.get(id as never)
+      if (ws === undefined) return undefined
+      const archived = new Set<string>(registry.archivedSessionIds)
+      return ws.sessionIds.filter(sessionId => !archived.has(sessionId))
+    },
+    ...(typeof registry.archiveSession === 'function'
+      ? { archiveSession: (sessionId: string) => registry.archiveSession(sessionId as Parameters<WorkspaceRegistry['archiveSession']>[0]) }
+      : {}),
   }
 }
 
@@ -187,6 +205,8 @@ export interface ToolDeps {
   workspaces: WorkspaceFace
   /** Current epoch ms (injectable for tests). */
   now: () => number
+  /** Shared startup barrier; tool definitions stay registered while services initialize. */
+  ready?: () => Promise<void>
   /**
    * Registered model provider routes (from the host llm runtime), for
    * advisory validation of pinned models; undefined = runtime unavailable,
@@ -281,16 +301,17 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
 
   // Env-gated tool-call tracing (ATB_TRACE=1) — evidence for protocol E2E.
   const register = (tool: { name: string; execute?: unknown }) => {
-    if (process.env.ATB_TRACE === '1' && typeof tool.execute === 'function') {
+    if (typeof tool.execute === 'function') {
       const orig = tool.execute as (args: unknown, exec: unknown) => Promise<unknown>
       tool.execute = async (args: unknown, exec: unknown) => {
-        console.error(`[atb ▶] ${tool.name}`, JSON.stringify(args).slice(0, 300))
+        await deps.ready?.()
+        if (process.env.ATB_TRACE === '1') console.error(`[atb ▶] ${tool.name}`, JSON.stringify(args).slice(0, 300))
         try {
           const result = await orig(args, exec)
-          console.error(`[atb ✓] ${tool.name}`, JSON.stringify(result).slice(0, 300))
+          if (process.env.ATB_TRACE === '1') console.error(`[atb ✓] ${tool.name}`, JSON.stringify(result).slice(0, 300))
           return result
         } catch (error) {
-          console.error(`[atb ✗] ${tool.name}`, String(error).slice(0, 400))
+          if (process.env.ATB_TRACE === '1') console.error(`[atb ✗] ${tool.name}`, String(error).slice(0, 400))
           throw error
         }
       }
@@ -366,7 +387,7 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
     description:
       'Create a task on the board. Required: title, workspaceId (project), urgency (urgent/normal/relaxed). '
       + 'Optional: description, prompt (sent to a fresh session on execution), status (default todo), '
-      + 'execution mode (claim|scheduled + cron), model {provider, model} to pin executions to a model. '
+      + 'execution mode (claim | scheduled+cron 定期重复 | scheduled+runAt 定时一次), model {provider, model} to pin executions to a model. '
       + 'Do not track trivial requests as tasks.',
     parameters: {
       title: { type: 'string', required: true, description: 'Short imperative line (1..200 chars).' },
@@ -378,10 +399,11 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
       execution: {
         type: 'object',
         additionalProperties: false,
-        description: 'Execution config: { mode: "claim" } (default) or { mode: "scheduled", cron: "m h dom mon dow" }.',
+        description: 'Execution config: { mode: "claim" } (default) | { mode: "scheduled", cron } periodic (定期, repeats) | { mode: "scheduled", runAt } one-shot (定时, fires once).',
         properties: {
           mode: { type: 'string', description: 'claim | scheduled.' },
-          cron: { type: 'string', description: 'Five-field cron expression (scheduled only).' },
+          cron: { type: 'string', description: 'Five-field cron expression (scheduled periodic only).' },
+          runAt: { type: 'string', description: 'One-shot trigger time: epoch ms or ISO string (scheduled one-shot only; must be in the future).' },
         },
       },
       model: {
@@ -398,6 +420,10 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
         type: 'string',
         description: 'Code isolation for executions: "worktree" (each run gets a fresh git worktree on branch task/<标题>+<taskId>) or "none" (run in the project directory, zero git interaction). Omitted → the board default (看板设置 → 默认执行隔离; factory default "none").',
       },
+      permission: {
+        type: 'string',
+        description: 'Execution permission: "read-only", "workspace-write", or "danger-full-access". Omitted → the board default (看板设置 → 默认权限; factory default "workspace-write").',
+      },
       presetId: {
         type: 'string',
         description: 'Agent preset the execution session is composed from (its tool set / persona); default = the deployment default preset. Optional.',
@@ -411,7 +437,7 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
     output: {
       schema: JSON_OUT,
       render: (_args, value) => {
-        const v = value as { task?: { id?: string; status?: string; version?: number } }
+        const v = value as { task?: { id?: string; status?: string; version?: number }; sessionArchive?: SessionArchiveResult }
         const t = v.task
         return [{ type: 'text', text: t === undefined ? '创建失败。' : `已创建任务 ${t.id} [${t.status}] v${t.version}。写入前先 taskboard_get 读取。` }]
       },
@@ -423,9 +449,10 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
       status?: string
       description?: string
       prompt?: string
-      execution?: { mode?: string; cron?: string }
+      execution?: { mode?: string; cron?: string; runAt?: string | number }
       model?: { provider?: string; model?: string }
       isolation?: string
+      permission?: string
       presetId?: string
       checklist?: string[]
     }, exec: unknown) {
@@ -446,6 +473,9 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
         // (看板设置) at creation, so later setting changes never rewrite
         // existing tasks.
         const isolation = args.isolation === undefined ? defaultIsolationOf(store.snapshot().settings) : asIsolation(args.isolation)
+        // Match the GUI create route: freeze the current board default onto
+        // the task so later settings changes do not silently alter a schedule.
+        const permission = args.permission === undefined ? defaultPermissionOf(store.snapshot().settings) : asPermission(args.permission)
         const presetId = args.presetId?.trim() || undefined
         // T9: match the GUI create route — trim and drop blank lines instead
         // of failing the whole call over one empty string.
@@ -464,6 +494,7 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
           execution,
           model,
           isolation,
+          permission,
           ...(presetId !== undefined ? { presetId } : {}),
           ...(checklist !== undefined ? { checklist } : {}),
           version: 1,
@@ -487,7 +518,7 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
   disposers.push(register(defineTool({
     name: 'taskboard_update',
     description:
-      'Update a task\'s title/description/prompt/urgency/blocked. Requires ifVersion (read first). '
+      'Update a task\'s title/description/prompt/urgency/blocked/permission. Requires ifVersion (read first). '
       + 'The model and execution config are read-only through this tool (they belong to the task owner/user).',
     parameters: {
       id: { type: 'string', required: true, description: 'Task id.' },
@@ -497,11 +528,12 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
       prompt: { type: 'string', description: 'New execution prompt.' },
       urgency: { type: 'string', description: 'urgent | normal | relaxed.' },
       blocked: { type: 'boolean', description: 'Blocked marker (work cannot continue right now).' },
+      permission: { type: 'string', description: 'Execution permission: read-only | workspace-write | danger-full-access.' },
     },
     output: {
       schema: JSON_OUT,
       render: (_args, value) => {
-        const v = value as { task?: { id?: string; status?: string; version?: number } }
+        const v = value as { task?: { id?: string; status?: string; version?: number }; sessionArchive?: SessionArchiveResult }
         const t = v.task
         return [{ type: 'text', text: t === undefined ? '更新失败。' : `已更新任务 ${t.id}，当前 v${t.version} [${t.status}]。` }]
       },
@@ -514,6 +546,7 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
       prompt?: string
       urgency?: string
       blocked?: boolean
+      permission?: string
     }, exec: unknown) {
       try {
         const { actor } = caller(exec as ToolRunContext)
@@ -531,6 +564,7 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
           if (args.prompt !== undefined) next.prompt = normalizePrompt(args.prompt)
           if (args.urgency !== undefined) next.urgency = asUrgency(args.urgency)
           if (args.blocked !== undefined) next.blocked = args.blocked
+          if (args.permission !== undefined) next.permission = asPermission(args.permission)
           next.version = task.version + 1
           next.updatedAt = deps.now()
           next.updatedBy = actor
@@ -554,16 +588,17 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
       id: { type: 'string', required: true, description: 'Task id.' },
       status: { type: 'string', required: true, description: 'Target status.' },
       ifVersion: { type: 'number', required: true, description: 'Task version you read; fails on mismatch.' },
+      archiveSessions: { type: 'boolean', description: 'When moving to archived: whether to archive associated execution sessions as well. Defaults to false.' },
     },
     output: {
       schema: JSON_OUT,
       render: (_args, value) => {
-        const v = value as { task?: { id?: string; status?: string; version?: number } }
+        const v = value as { task?: { id?: string; status?: string; version?: number }; sessionArchive?: SessionArchiveResult }
         const t = v.task
-        return [{ type: 'text', text: t === undefined ? '移动失败。' : `任务 ${t.id} 已移到 ${t.status}，当前 v${t.version}。` }]
+        return [{ type: 'text', text: t === undefined ? '移动失败。' : `任务 ${t.id} 已移到 ${t.status}，当前 v${t.version}。${v.sessionArchive === undefined ? '' : ` 会话归档结果：${JSON.stringify(v.sessionArchive)}`}` }]
       },
     },
-    async execute(args: { id: string; status: string; ifVersion: number }, exec: unknown) {
+    async execute(args: { id: string; status: string; ifVersion: number; archiveSessions?: boolean }, exec: unknown) {
       try {
         const { actor } = caller(exec as ToolRunContext)
         const to = asStatus(args.status)
@@ -575,9 +610,11 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
           : undefined
         // R1: every state guard + the write itself run inside the mutation.
         let next: TaskRecord | undefined
+        let beforeTask: TaskRecord | undefined
         await store.mutate('task-moved', ledger => {
           const { index, task } = liveTaskAt(ledger, args.id)
           versionGuard(task, args.ifVersion)
+          beforeTask = task
 
           // Code-level gate: agents never complete a task.
           if (to === 'done') {
@@ -607,7 +644,10 @@ export function registerTaskboardTools(ctx: ToolContextFace, deps: ToolDeps): Ar
           ledger.tasks[index] = next
           return [next]
         })
-        return json({ task: summarize(next!) })
+        const sessionArchive = to === 'archived' && args.archiveSessions === true
+          ? await archiveTaskSessions(beforeTask ?? next!, deps.workspaces.archiveSession)
+          : undefined
+        return json({ task: summarize(next!), ...(sessionArchive !== undefined ? { sessionArchive } : {}) })
       } catch (error) { fail(error) }
     },
   })) as () => void)

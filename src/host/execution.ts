@@ -6,17 +6,22 @@
  * prompt is submitted as an ordinary user message, and the turn settlement
  * (turn/end reason) is folded back into the task's execution record.
  *
- * Every execution is a NEW session: clean context, no reuse of previous runs.
+ * Manual runs open fresh sessions; scheduled runs can resume their previous
+ * session while keeping separate execution records and settlement watchers.
  *
  * @module dsh-taskboard/host/execution
  */
 import {
   DEFAULT_PERMISSION,
   effectiveIsolation,
+  DEFAULT_MAX_CONCURRENT,
   effectivePrompt,
   newCommentId,
   newExecutionId,
+  nextCronTime,
   normalizeBody,
+  parseCron,
+  spawnNextCycle,
   type ExecutionRecord,
   type ExecutionRepoEvidence,
   type IsolationMode,
@@ -30,11 +35,24 @@ import { createRepoScanner, type RepoScanner } from './repos.ts'
 import { MessageId } from './sdk.ts'
 import type { TaskStore } from './store.ts'
 
-/** Default cap on concurrently running executions (env-overridable). */
-export const DEFAULT_MAX_CONCURRENT = 3
+/**
+ * Producer-owned message source kind for the framing line dsh-taskboard injects
+ * at the head of each execution turn (the "plugin context row"). dsh 0.1.7-rc.2
+ * retired the generic `kind: 'plugin'` source — the v4 session format now
+ * requires every durable message to carry a producer-owned source kind (a
+ * non-empty string that is not `'plugin'`), declared here so the taskboard owns
+ * its attribution instead of using the retired wrapper.
+ */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-taskboard': { kind: 'dsh-taskboard' }
+  }
+}
 
 /** Narrow agents face (the registry's create, structurally). */
 export interface AgentsFace {
+  /** Restore a compatible scheduled session; undefined means it is unavailable. */
+  resumeScheduled?(sessionId: string, options: Parameters<AgentsFace['create']>[0]): Promise<Awaited<ReturnType<AgentsFace['create']>> | undefined>
   create(options: {
     sessionId: string
     meta?: { cwd?: string; agentPreset?: string }
@@ -44,12 +62,21 @@ export interface AgentsFace {
   }): Promise<{
     agent: {
       id: string
+      /** Present on the real DSH agent; rechecked immediately before dispatch. */
+      readonly status?: 'idle' | 'running'
       followup(message: unknown): void
       inject(message: unknown): void
       whenIdle(): Promise<void>
     }
     dispose(): Promise<void>
+    /** Live sessions borrowed from another owner must survive cancelled startup. */
+    borrowed?: boolean
   }>
+}
+
+/** A live agent retained by DSH across a plugin hot reload. */
+export type LiveAgentFace = Awaited<ReturnType<AgentsFace['create']>>['agent'] & {
+  cancel(cause: { kind: 'user' }): void
 }
 
 /**
@@ -72,7 +99,7 @@ export interface ExecutionWorkspaceFace {
 
 /** Narrow event-bus face for settlement listening. */
 export interface EventsFace {
-  onSessionEvent(listener: (sessionId: string, event: { type: string; data?: unknown }, sessionMeta?: { header?: { cwd?: string } }) => void): () => void
+  onSessionEvent(listener: (sessionId: string, event: { type: string; data?: unknown }, sessionMeta?: { header?: { cwd?: string } }) => void | Promise<void>): () => void
 }
 
 /** Everything the execution service needs. */
@@ -91,7 +118,9 @@ export interface ExecutionDeps {
   /** Best-effort session rename (pins the session list title to the task title). */
   renameSession?: (sessionId: string, title: string) => void
   /** Max concurrently running executions across all tasks (default 3). */
-  maxConcurrent?: number
+  maxConcurrent?: number | (() => number)
+  /** Resolve a still-live agent so reload reconciliation can adopt its run. */
+  liveAgent?: (sessionId: string) => LiveAgentFace | undefined
   /**
    * Git face for worktree isolation (0.3.0). Absent → every worktree-mode
    * task degrades to the original directory with an isolationNote.
@@ -147,6 +176,11 @@ export interface RunOptions {
    * main HEAD. Falls back to a fresh preparation when none is alive.
    */
   reuseWorktree?: boolean
+  /**
+   * Scheduler-only dispatch token. The execution gate consumes the matching
+   * durable queue entry in the same mutation that creates the running record.
+   */
+  scheduledWindow?: number
 }
 
 /** One live execution tracked for settlement and cancellation. */
@@ -158,6 +192,9 @@ interface RunEntry {
   dispose: () => Promise<void>
 }
 
+const ACTIVITY_PERSIST_MS = 60_000
+const ACTIVITY_EVENTS = new Set(['turn/start', 'turn/step', 'turn/progress', 'agent/step', 'agent/thought', 'user/message'])
+
 /**
  * The execution service.
  */
@@ -168,9 +205,17 @@ export class ExecutionService {
   /** Detaches the turn/end listener (plugin teardown — review P1). */
   private readonly unsubscribeEvents: () => void
 
+  /** Last activity persistence attempt per live session (avoid per-event disk writes). */
+  private readonly lastActivityAt = new Map<string, number>()
+
   /** @param deps - store + agents + workspaces + events + clock. */
   constructor(private readonly deps: ExecutionDeps) {
     this.unsubscribeEvents = deps.events.onSessionEvent((sessionId, event) => {
+      if (ACTIVITY_EVENTS.has(event.type)) {
+        this.noteActivity(sessionId).catch(error => {
+          console.error('[dsh-taskboard] activity persistence error:', error)
+        })
+      }
       if (event.type !== 'turn/end') return
       // S7 (open question): ANY turn/end with an error reason fails the whole
       // execution and hands the task back. Whether the DSH session loop can
@@ -189,6 +234,75 @@ export class ExecutionService {
   /** Detach the settlement listener; safe to call once at plugin teardown. */
   dispose(): void {
     this.unsubscribeEvents()
+  }
+
+  /** Record execution activity at most once per minute for an accurate stale badge. */
+  private async noteActivity(sessionId: string): Promise<void> {
+    const now = this.deps.now()
+    const previous = this.lastActivityAt.get(sessionId)
+    if (previous !== undefined && now - previous < ACTIVITY_PERSIST_MS) return
+    const entry = [...this.runs.entries()].find(([, run]) => run.sessionId === sessionId)
+    if (entry === undefined) return
+    this.lastActivityAt.set(sessionId, now)
+    const [executionId] = entry
+    await this.deps.store.mutate('execution-recorded', ledger => {
+      for (const task of ledger.tasks) {
+        const execution = task.executions.find(current => current.id === executionId)
+        if (execution?.outcome !== 'running') continue
+        if (execution.lastActivityAt !== undefined && now - execution.lastActivityAt < ACTIVITY_PERSIST_MS) return undefined
+        execution.lastActivityAt = now
+        return [task]
+      }
+      return undefined
+    })
+  }
+
+  /** Recreate enough mirror metadata from the durable start record to collect settlement facts. */
+  private preparedFromExecution(execution: ExecutionRecord): PreparedMirror | undefined {
+    if (execution.repos !== undefined && execution.repos.length > 0
+      && execution.repos.every(repo => repo.baseCommit !== undefined)) {
+      const repos = execution.repos.map(repo => ({
+        repo: repo.repo,
+        branch: repo.branch,
+        worktreePath: repo.worktreePath,
+        baseCommit: repo.baseCommit!,
+        reused: true,
+      }))
+      return { root: repos.find(repo => repo.repo === '')?.worktreePath ?? repos[0]!.worktreePath, repos, skipped: [], allReused: true }
+    }
+    if (execution.branch !== undefined && execution.worktreePath !== undefined && execution.baseCommit !== undefined) {
+      return {
+        root: execution.worktreePath,
+        repos: [{ repo: '', branch: execution.branch, worktreePath: execution.worktreePath, baseCommit: execution.baseCommit, reused: true }],
+        skipped: [],
+        allReused: true,
+      }
+    }
+    return undefined
+  }
+
+  /** Attach a new-generation settlement watcher without taking ownership of the live agent. */
+  private adoptLiveRun(executionId: string, sessionId: string, agent: LiveAgentFace, prepared: PreparedMirror | undefined): void {
+    if (this.runs.has(executionId)) return
+    const settle = (): void => {
+      if (!this.runs.has(executionId)) return
+      this.runs.delete(executionId)
+      void this.settleExecution(executionId, sessionId, prepared)
+    }
+    this.runs.set(executionId, {
+      sessionId,
+      ...(prepared !== undefined ? { prepared } : {}),
+      settle,
+      // The hot-reloaded service did not create this agent, but it can still
+      // honor the existing stop button through the live registry face.
+      dispose: async () => { agent.cancel({ kind: 'user' }); await agent.whenIdle() },
+    })
+    this.lastActivityAt.set(sessionId, this.deps.now())
+    void agent.whenIdle().then(settle, () => {
+      this.noteFailure(sessionId, 'agent did not reach quiescence', executionId)
+        .then(() => { this.runs.delete(executionId) })
+        .catch(() => { this.runs.delete(executionId) })
+    })
   }
 
   /**
@@ -269,15 +383,17 @@ export class ExecutionService {
    * releasing its run entry, so a success settlement can never race it into
    * the ledger and record a failed run as succeeded.
    */
-  private noteFailure(sessionId: string, message: string): Promise<void> {
+  private noteFailure(sessionId: string, message: string, executionId?: string): Promise<void> {
     // The failed session may already have committed work — collect the
     // evidence (best effort) BEFORE marking the execution failed (0.3.1).
-    const entry = [...this.runs.values()].find(e => e.sessionId === sessionId)
+    const match = [...this.runs.entries()].find(([id, e]) => e.sessionId === sessionId && (executionId === undefined || id === executionId))
+    if (match === undefined) return Promise.resolve()
+    const [failedId, entry] = match
     return this.collectEvidence(entry?.prepared).then(evidence =>
       this.deps.store.mutate('execution-recorded', (ledger) => {
         for (const task of ledger.tasks) {
           for (const execution of task.executions) {
-            if (execution.sessionId === sessionId && execution.outcome === 'running') {
+            if (execution.id === failedId && execution.outcome === 'running') {
               execution.outcome = 'failed'
               execution.error = message.slice(0, 500)
               execution.endedAt = this.deps.now()
@@ -293,6 +409,8 @@ export class ExecutionService {
                 task.comments.push({
                   id: newCommentId(),
                   body: normalizeBody(`[系统] 执行失败：${message.slice(0, 300)}；任务已退回待办。`),
+                  systemKey: 'sys.execFailed',
+                  systemParams: { error: message.slice(0, 300) },
                   version: 1,
                   createdAt: this.deps.now(),
                 })
@@ -339,7 +457,7 @@ export class ExecutionService {
    * @returns the immediate result; settlement lands in the ledger.
    */
   async run(taskId: string, trigger: ExecutionRecord['trigger'], options?: RunOptions): Promise<RunRequestResult> {
-    const max = this.deps.maxConcurrent ?? DEFAULT_MAX_CONCURRENT
+    const max = typeof this.deps.maxConcurrent === 'function' ? this.deps.maxConcurrent() : this.deps.maxConcurrent ?? DEFAULT_MAX_CONCURRENT
     if (this.runs.size >= max) {
       return { ok: false, error: `execution concurrency limit reached (${this.runs.size}/${max} running)` }
     }
@@ -353,7 +471,7 @@ export class ExecutionService {
     }
 
     const executionId = newExecutionId()
-    const sessionId = this.deps.mintSessionId?.() ?? `session-taskboard-${crypto.randomUUID()}`
+    let sessionId = this.deps.mintSessionId?.() ?? `session-taskboard-${crypto.randomUUID()}`
 
     // 0. Resolve code isolation (plan §3.2): explicit 'none' → zero git calls;
     //    'worktree' (also the omitted default) → prepare below, degrading to
@@ -370,7 +488,23 @@ export class ExecutionService {
         gate = `no task ${taskId}`
         return undefined
       }
-      if (target.status === 'in_progress') {
+      // A status may change after the scheduler selected/advanced the task.
+      // Recheck at the atomic execution gate so terminal tasks cannot be
+      // revived by that race. Only todo fires scheduled (periodic or one-
+      // shot); an in_review card is finished work and never refires — a
+      // periodic run's successor todo card carries the schedule onward.
+      // Manual reruns keep their existing semantics.
+      if (trigger === 'scheduled' && target.status !== 'todo') {
+        gate = `scheduled task is not actionable (${target.status})`
+        return undefined
+      }
+      if (trigger === 'scheduled' && options?.scheduledWindow !== undefined
+        && target.execution.dispatchingRunAt !== options.scheduledWindow) {
+        gate = 'scheduled dispatch is no longer queued'
+        return undefined
+      }
+      if (target.status === 'in_progress' || target.executions.some(e => e.outcome === 'running')
+        || [...this.runs.values()].some(e => target.executions.some(x => x.sessionId === e.sessionId))) {
         gate = 'task is already in progress'
         return undefined
       }
@@ -386,9 +520,15 @@ export class ExecutionService {
         id: executionId,
         trigger,
         startedAt: this.deps.now(),
+        lastActivityAt: this.deps.now(),
         outcome: 'running',
         ...(isolation === 'none' ? { isolation: 'none' as const } : { isolation: 'worktree' as const, branch }),
       })
+      if (options?.scheduledWindow !== undefined) {
+        delete target.execution.dispatchingRunAt
+        delete target.execution.queuedAt
+        target.execution.lastTriggeredAt = options.scheduledWindow
+      }
       target.status = 'in_progress'
       target.updatedAt = this.deps.now()
       target.updatedBy = { kind: 'system' }
@@ -398,45 +538,45 @@ export class ExecutionService {
     })
     if (gate !== undefined) return { ok: false, error: gate }
 
-    // 1b. Worktree preparation (fail-soft): any failure degrades this run to
-    //     the original directory with an isolationNote — the ledger and the
-    //     execution pipeline itself never fail over git. 0.6.3: preparation
-    //     builds a whole-workspace MIRROR (root repo + nested repos); a plain
-    //     single-repo workspace keeps the legacy record shape everywhere.
     let isolationNote: string | undefined
     let prepared: PreparedMirror | undefined
-    if (isolation === 'worktree') {
-      if (this.deps.git === undefined) {
-        isolationNote = 'git 集成不可用，已在原目录执行'
-        await this.patchExecution(executionId, { isolation: 'none', isolationNote, branch: undefined, worktreePath: undefined, baseCommit: undefined })
-      } else {
-        const outcome = await prepareMirror(
-          { git: this.deps.git, scanner: this.deps.scanner ?? createRepoScanner() },
-          { workspacePath: workspace.path, taskId: task.id, branch, reuse: options?.reuseWorktree === true },
-        )
-        if ('mirror' in outcome) {
-          prepared = outcome.mirror
-          await this.pinBranches(task, prepared)
-          // Persist the isolation facts of the run (branch is already on the
-          // record from the gate mutation). The root repo keeps the legacy
-          // flat fields; non-legacy mirrors also record per-repo entries.
-          const root = prepared.repos[0]
-          await this.patchExecution(executionId, {
-            worktreePath: root?.worktreePath,
-            baseCommit: root?.baseCommit,
-            ...(!isLegacySingle(prepared)
-              ? { repos: prepared.repos.map(r => ({ repo: r.repo, branch: r.branch, worktreePath: r.worktreePath, baseCommit: r.baseCommit })) }
-              : {}),
-          })
-        } else {
-          isolationNote = outcome.note
-          // Degraded run: clear the optimistic worktree markers.
+
+    // Check reusable sessions before resetting any scheduled worktree.
+    const prepareIsolation = async (): Promise<void> => {
+      if (isolation === 'worktree') {
+        if (this.deps.git === undefined) {
+          isolationNote = 'git 集成不可用，已在原目录执行'
           await this.patchExecution(executionId, { isolation: 'none', isolationNote, branch: undefined, worktreePath: undefined, baseCommit: undefined })
+        } else {
+          const outcome = await prepareMirror(
+            { git: this.deps.git, scanner: this.deps.scanner ?? createRepoScanner() },
+            { workspacePath: workspace.path, taskId: task.id, branch, reuse: options?.reuseWorktree === true },
+          )
+          if ('mirror' in outcome) {
+            prepared = outcome.mirror
+            await this.pinBranches(task, prepared)
+            // Persist the isolation facts of the run (branch is already on the
+            // record from the gate mutation). The root repo keeps the legacy
+            // flat fields; non-legacy mirrors also record per-repo entries.
+            const root = prepared.repos[0]
+            await this.patchExecution(executionId, {
+              worktreePath: root?.worktreePath,
+              baseCommit: root?.baseCommit,
+              ...(!isLegacySingle(prepared)
+                ? { repos: prepared.repos.map(r => ({ repo: r.repo, branch: r.branch, worktreePath: r.worktreePath, baseCommit: r.baseCommit })) }
+                : {}),
+            })
+          } else {
+            isolationNote = outcome.note
+            // Degraded run: clear the optimistic worktree markers.
+            await this.patchExecution(executionId, { isolation: 'none', isolationNote, branch: undefined, worktreePath: undefined, baseCommit: undefined })
+          }
         }
       }
     }
+    if (trigger !== 'scheduled') await prepareIsolation()
 
-    // 2. Create the fresh agent+session inside the task's project, carrying
+    // 2. Create or resume the agent+session inside the task's project, carrying
     //    the pinned model — or the deployment default when unpinned (the
     //    persona template renders {{model}}, so the session always needs one).
     //    The session cwd is ALWAYS the project root: DSH's session model
@@ -461,9 +601,10 @@ export class ExecutionService {
       return { ok: false, error: `preset composition failed: ${message}` }
     }
     let handle: Awaited<ReturnType<AgentsFace['create']>>
+    let sessionReuseKey: string | undefined
     try {
       const model = task.model ?? this.deps.defaultModel?.()
-      handle = await this.deps.agents.create({
+      const createOptions: Parameters<AgentsFace['create']>[0] = {
         sessionId,
         meta: {
           cwd: workspace.path,
@@ -477,7 +618,39 @@ export class ExecutionService {
           },
         } : {}),
         ...(composition !== undefined ? { setup: composition.setup } : {}),
-      })
+      }
+      // Persist the effective settings, including resolved defaults. Never
+      // continue history under a different project, model, preset or boundary.
+      sessionReuseKey = JSON.stringify([
+        task.workspaceId, workspace.path, composition?.agentPreset ?? null,
+        model?.provider ?? null, model?.model ?? null, model?.reasoningEffort ?? null,
+        task.permission ?? DEFAULT_PERMISSION, isolation,
+      ])
+      const selectedSessionId = trigger === 'scheduled' ? task.execution.reuseSessionId : undefined
+      if (selectedSessionId !== undefined) {
+        const resumed = await this.deps.agents.resumeScheduled?.(selectedSessionId, createOptions)
+        if (resumed === undefined) throw new Error(`selected session ${selectedSessionId} is unavailable, busy, archived, or incompatible`)
+        handle = resumed
+      } else {
+        // A task can explicitly require a fresh conversation every time. Old
+        // ledgers omit sessionReuseMode and deliberately retain #26's legacy
+        // auto-reuse behavior.
+        const reuseCreatedSession = trigger === 'scheduled' && task.execution.cron !== undefined
+          && task.execution.sessionReuseMode !== 'fresh'
+        const previous = trigger === 'scheduled'
+          ? [...task.executions].reverse().find(e => e.trigger === 'scheduled' && e.sessionId !== undefined)
+          : undefined
+        const automaticSessionId = task.execution.autoReuseSessionId
+          ?? (previous?.sessionReuseKey === sessionReuseKey ? previous.sessionId : undefined)
+        const automaticSessionKey = task.execution.autoReuseSessionId !== undefined
+          ? task.execution.autoReuseSessionKey
+          : previous?.sessionReuseKey
+        const resumed = reuseCreatedSession && automaticSessionKey === sessionReuseKey && automaticSessionId !== undefined
+          ? await this.deps.agents.resumeScheduled?.(automaticSessionId, createOptions)
+          : undefined
+        handle = resumed ?? await this.deps.agents.create(createOptions)
+      }
+      sessionId = handle.agent.id
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       await this.patchExecution(executionId, { outcome: 'failed', error: message.slice(0, 500), endedAt: this.deps.now() })
@@ -486,6 +659,8 @@ export class ExecutionService {
       await this.cleanupMirror(prepared, workspace.path)
       return { ok: false, error: message }
     }
+
+    if (trigger === 'scheduled') await prepareIsolation()
 
     // R3: the startup path above awaited seconds of git + agent work. A
     // cancel() that landed inside that window already settled the execution
@@ -497,7 +672,7 @@ export class ExecutionService {
     const stillRunning = await this.deps.store.read(ledger =>
       ledger.tasks.some(t => t.executions.some(e => e.id === executionId && e.outcome === 'running')))
     if (!stillRunning) {
-      await handle.dispose().catch(() => { /* best effort */ })
+      if (!handle.borrowed) await handle.dispose().catch(() => { /* best effort */ })
       // S1: do not leave the startup artifacts behind a cancelled run either.
       await this.cleanupMirror(prepared, workspace.path)
       return { ok: false, error: 'cancelled during startup' }
@@ -517,11 +692,38 @@ export class ExecutionService {
     //     session list shows the task name (a user-sourced title also stops
     //     automatic first-prompt retitling).
     try {
-      this.deps.renameSession?.(sessionId, task.title)
+      if (task.execution.reuseSessionId !== sessionId) this.deps.renameSession?.(sessionId, task.title)
     } catch { /* cosmetic */ }
 
     // 4. Record the session id (execution is really started now).
-    await this.patchExecution(executionId, { sessionId })
+    await this.deps.store.mutate('execution-recorded', ledger => {
+      const target = ledger.tasks.find(t => t.id === taskId)
+      const execution = target?.executions.find(e => e.id === executionId && e.outcome === 'running')
+      if (target === undefined || execution === undefined) return undefined
+      Object.assign(execution, { sessionId, ...(trigger === 'scheduled' ? { sessionReuseKey } : {}) })
+      // `reuse` is independent of periodic completion: once the first run
+      // creates a session, successor cards inherit this pointer and continue
+      // it; `fresh` never records a continuation target.
+      if (trigger === 'scheduled' && target.execution.cron !== undefined && target.execution.reuseSessionId === undefined
+        && target.execution.sessionReuseMode !== 'fresh') {
+        target.execution.autoReuseSessionId = sessionId
+        target.execution.autoReuseSessionKey = sessionReuseKey
+      }
+      target.claimedBy = sessionId
+      return [target]
+    })
+
+    // Attach/ledger writes above may yield to manual activity or cancellation.
+    // Do not inject a scheduled prompt into an already running conversation.
+    const current = this.deps.store.get(taskId)?.executions.find(e => e.id === executionId)
+    if (current?.outcome !== 'running' || handle.agent.status === 'running') {
+      if (!handle.borrowed) await handle.dispose().catch(() => { /* best effort */ })
+      if (current?.outcome === 'running') {
+        await this.patchExecution(executionId, { outcome: 'failed', error: 'scheduled session is busy', endedAt: this.deps.now() })
+        await this.revertProgress(taskId)
+      }
+      return { ok: false, error: current?.outcome === 'running' ? 'scheduled session is busy' : 'cancelled during startup' }
+    }
 
     // 5. Submit the opening pair and settle on quiescence (turn/end errors
     //    were already folded by the listener). Two messages, ONE turn:
@@ -535,7 +737,7 @@ export class ExecutionService {
       id: this.deps.mintMessageId?.() ?? MessageId(`msg-taskboard-${crypto.randomUUID()}`),
       role: 'user' as const,
       content: [{ type: 'text' as const, text: this.pluginFraming(task, prepared, isolationNote) }],
-      source: { kind: 'plugin' as const, plugin: 'dsh-taskboard' },
+      source: { kind: 'dsh-taskboard' as const },
     })
     handle.agent.followup({
       id: this.deps.mintMessageId?.() ?? MessageId(`msg-taskboard-${crypto.randomUUID()}`),
@@ -549,10 +751,12 @@ export class ExecutionService {
     //    when the session did NOT follow the handoff protocol — auto-move the
     //    card to in_review with a system comment.
     const settle = (): void => {
+      if (!this.runs.has(executionId)) return
       this.runs.delete(executionId)
       void this.settleExecution(executionId, sessionId, prepared)
     }
     this.runs.set(executionId, { sessionId, ...(prepared !== undefined ? { prepared } : {}), settle, dispose: () => handle.dispose() })
+    this.lastActivityAt.set(sessionId, this.deps.now())
     // R2: the rejection path owns its state transition EXCLUSIVELY — the old
     // code also called settle() here, racing two evidence collections whose
     // mutations both checked outcome === 'running': whoever committed first
@@ -560,7 +764,7 @@ export class ExecutionService {
     // succeeded (and auto-moved to in_review). Now only the failure
     // settlement writes, and the run entry is released after it commits.
     void handle.agent.whenIdle().then(settle, () => {
-      this.noteFailure(sessionId, 'agent did not reach quiescence')
+      this.noteFailure(sessionId, 'agent did not reach quiescence', executionId)
         .then(() => { this.runs.delete(executionId) })
         .catch(() => { this.runs.delete(executionId) })
     })
@@ -591,19 +795,101 @@ export class ExecutionService {
             delete t.claimedBy
             delete t.claimedAt
           }
+          const periodicCompletion = execution.trigger === 'scheduled' && t.execution.cron !== undefined
+            ? t.execution.periodicCompletion ?? 'spawn'
+            : undefined
+          // These policies are host-owned: an agent may follow the ordinary
+          // hand-off protocol and already have moved the card to in_review,
+          // but that must never suppress the selected periodic continuation.
+          if (periodicCompletion === 'rearm') {
+            t.status = 'todo'
+            t.updatedAt = now
+            t.updatedBy = { kind: 'system' }
+            t.comments.push({
+              id: newCommentId(),
+              body: normalizeBody('[系统] 定期任务本轮执行完成，已按设置自动回到待办，等待下一次触发。'),
+              systemKey: 'sys.periodicRearmed',
+              version: 1,
+              createdAt: now,
+            })
+            return [t]
+          }
+          if (periodicCompletion === 'spawn') {
+            const match = parseCron(t.execution.cron!)
+            const next = match === null ? undefined : nextCronTime(match, now) ?? undefined
+            t.status = 'in_review'
+            t.updatedAt = now
+            t.updatedBy = { kind: 'system' }
+            if (next !== undefined) {
+              const successor = spawnNextCycle(t, executionId, now)
+              t.execution = { mode: 'claim' }
+              t.comments.push({
+                id: newCommentId(),
+                body: normalizeBody(`[系统] 定期任务本轮执行完毕，已按设置新建待办卡 ${successor.id} 承接下一轮，请审查本卡后验收。`),
+                systemKey: 'sys.periodicHandoff',
+                systemParams: { nextTaskId: successor.id },
+                version: 1,
+                createdAt: now,
+              })
+              ledger.tasks.push(successor)
+              return [t, successor]
+            }
+            t.execution = { mode: 'claim' }
+            t.comments.push({
+              id: newCommentId(),
+              body: normalizeBody('[系统] 定期表达式已无未来触发时间，本轮结束后定时停用；如需继续请重新设置。'),
+              systemKey: 'sys.cronDead',
+              version: 1,
+              createdAt: now,
+            })
+            return [t]
+          }
           if (t.status === 'in_progress') {
-            const commented = t.comments.some(c => c.threadId === sessionId)
+            const commented = t.comments.some(c => c.threadId === sessionId && c.createdAt >= (execution.startedAt ?? 0))
             t.comments.push({
               id: newCommentId(),
               body: normalizeBody(commented
                 ? '[系统] 执行会话已结束并留有评论，但未移至待验收；系统自动移入待验收。'
                 : '[系统] 执行会话已结束，但未按协议交接（无评论、未移至待验收）；系统自动移入待验收，请审查后退回或验收。'),
+              systemKey: commented ? 'sys.endedWithComment' : 'sys.endedNoHandoff',
               version: 1,
               createdAt: now,
             })
             t.status = 'in_review'
             t.updatedAt = now
             t.updatedBy = { kind: 'system' }
+            // Periodic scheduled success (定期执行): the finished card stays
+            // here for acceptance while a fresh todo card minted from it
+            // carries the cron onward. The cron is consumed either way so
+            // the in_review card can never refire.
+            if (execution.trigger === 'scheduled' && t.execution.cron !== undefined) {
+              const match = parseCron(t.execution.cron)
+              const next = match === null ? undefined : nextCronTime(match, now) ?? undefined
+              if (next !== undefined) {
+                const successor = spawnNextCycle(t, executionId, now)
+                t.execution = { mode: 'claim' }
+                t.comments.push({
+                  id: newCommentId(),
+                  body: normalizeBody(`[系统] 定期任务本轮执行完毕，定时已由新待办卡 ${successor.id} 承接，请审查本卡后验收。`),
+                  systemKey: 'sys.periodicHandoff',
+                  systemParams: { nextTaskId: successor.id },
+                  version: 1,
+                  createdAt: now,
+                })
+                ledger.tasks.push(successor)
+                return [t, successor]
+              }
+              // Dead cron (no match within the scan window): consume it with
+              // a comment instead of letting the handoff die silently.
+              t.execution = { mode: 'claim' }
+              t.comments.push({
+                id: newCommentId(),
+                body: normalizeBody('[系统] 定期表达式已无未来触发时间，本轮结束后定时停用；如需继续请重新设置。'),
+                systemKey: 'sys.cronDead',
+                version: 1,
+                createdAt: now,
+              })
+            }
           }
           return [t]
         }
@@ -725,18 +1011,30 @@ export class ExecutionService {
   }
 
   /**
-   * Startup reconciliation after a host restart: executions left `running`
-   * by the previous process can never settle here (their settlement watchers
-   * died with it), so mark them failed and hand their tasks back to todo.
+   * Reconcile running records after load. A real process restart leaves no
+   * live agent, but a plugin hot reload does; retain and adopt those runs
+   * instead of recording a false "interrupted by host restart" failure.
    */
   async reconcile(): Promise<void> {
+    const adopted = new Map<string, { sessionId: string; agent: LiveAgentFace; prepared: PreparedMirror | undefined }>()
+    for (const task of this.deps.store.snapshot().tasks) {
+      for (const execution of task.executions) {
+        if (execution.outcome !== 'running' || execution.sessionId === undefined) continue
+        const agent = this.deps.liveAgent?.(execution.sessionId)
+        if (agent !== undefined) adopted.set(execution.id, {
+          sessionId: execution.sessionId,
+          agent,
+          prepared: this.preparedFromExecution(execution),
+        })
+      }
+    }
     await this.deps.store.mutate('execution-recorded', (ledger) => {
       const now = this.deps.now()
       const touched: TaskRecord[] = []
       for (const task of ledger.tasks) {
         let dirty = false
         for (const execution of task.executions) {
-          if (execution.outcome === 'running') {
+          if (execution.outcome === 'running' && !adopted.has(execution.id)) {
             execution.outcome = 'failed'
             execution.error = 'interrupted by host restart'
             execution.endedAt = now
@@ -754,6 +1052,14 @@ export class ExecutionService {
       }
       return touched.length > 0 ? touched : undefined
     })
+    for (const [executionId, entry] of adopted) {
+      // A concurrent old-generation settlement may already have finished it;
+      // the idempotent settlement mutation below then becomes a no-op.
+      const stillRunning = this.deps.store.snapshot().tasks.some(task =>
+        task.executions.some(execution => execution.id === executionId && execution.outcome === 'running'))
+      if (!stillRunning) continue
+      this.adoptLiveRun(executionId, entry.sessionId, entry.agent, entry.prepared)
+    }
   }
 
   /**
@@ -769,13 +1075,20 @@ export class ExecutionService {
    * @param degradeNote - why a worktree task degraded to the main directory.
    */
   private pluginFraming(task: TaskRecord, prepared?: PreparedMirror, degradeNote?: string): string {
+    const periodicCompletion = task.execution.mode === 'scheduled' && task.execution.cron !== undefined
+      ? task.execution.periodicCompletion ?? 'spawn'
+      : undefined
     let text = `【任务看板】${task.title}（ID: ${task.id}）\n`
       + `本会话由任务看板执行服务启动，任务已置为进行中——无需认领；「已完成」仅限用户在界面操作（代码已限制，移了会被拒）。\n`
       + `完成后按序交接：\n`
       + `1. taskboard_get 读取本任务，取得最新 version\n`
       + `2. taskboard_execution_report 提交结构化执行报告（做了什么/改了哪些文件/如何验证/剩余风险；提交与评论不冲突，都会展示给验收人）\n`
       + `3. taskboard_comment_add 留评论：做了什么改动 / 如何验证 / 剩余风险\n`
-      + `4. taskboard_move 将本任务移至待验收 in_review（带 ifVersion）\n`
+      + `${periodicCompletion === 'rearm'
+        ? '4. 本任务设为“完成后移回待办”：完成报告和评论后无需改变状态，宿主会在会话结束时自动回到待办。\n'
+        : periodicCompletion === 'spawn'
+          ? '4. 本任务设为“完成后新建待办”：完成报告和评论后无需改变状态，宿主会保留本卡待验收并新建下一轮待办卡。\n'
+          : '4. taskboard_move 将本任务移至待验收 in_review（带 ifVersion）\n'}`
       + `若无法完成：留评论说明原因，将任务移回待办 todo。`
     if (task.checklist !== undefined && task.checklist.length > 0) {
       const items = task.checklist

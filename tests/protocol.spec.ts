@@ -21,6 +21,10 @@ import {
   defaultIsolationOf,
   defaultPermissionOf,
   defaultSyncExternalSessionsOf,
+  dispatchIntervalMsOf,
+  maxConcurrentOf,
+  queueMaxAgeMinutesOf,
+  scheduleMissedAfterMinutesOf,
   effectiveIsolation,
   emptyLedger,
   isClaim,
@@ -37,6 +41,7 @@ import {
   normalizeRepoEvidence,
   validateLedgerImport,
   isValidTaskId,
+  taskAssociatedSessionIds,
   type TaskRecord,
 } from '../src/shared/protocol.ts'
 import { TASKBOARD_PROTOCOL } from '../src/host/protocol-text.ts'
@@ -67,6 +72,7 @@ describe('state machine', () => {
       expect(canTransition(from, 'canceled')).toBe(true)
     }
     expect(canTransition('done', 'archived')).toBe(true)
+    expect(canTransition('done', 'todo')).toBe(true)
     expect(canTransition('canceled', 'archived')).toBe(true)
     expect(canTransition('archived', 'todo')).toBe(false)
   })
@@ -120,6 +126,14 @@ describe('cron', () => {
     expect(scheduled.nextRunAt).toBeGreaterThan(0)
     expect(() => normalizeExecution({ mode: 'scheduled' }, 0)).toThrow()
     expect(() => normalizeExecution({ mode: 'bogus' }, 0)).toThrow()
+    const selected = normalizeExecution({ mode: 'scheduled', cron: '* * * * *', reuseSessionId: 'session-old' }, 0)
+    expect(selected.reuseSessionId).toBe('session-old')
+    expect(normalizeExecution({ mode: 'scheduled', cron: '* * * * *', sessionReuseMode: 'fresh' }, 0).sessionReuseMode).toBe('fresh')
+    expect(normalizeExecution({ mode: 'scheduled', cron: '* * * * *', sessionReuseMode: 'reuse' }, 0).sessionReuseMode).toBe('reuse')
+    expect(() => normalizeExecution({ mode: 'claim', reuseSessionId: 'session-old' }, 0)).toThrow('requires a scheduled task')
+    expect(() => normalizeExecution({ mode: 'scheduled', cron: '* * * * *', sessionReuseMode: 'always' }, 0)).toThrow('fresh')
+    expect(() => normalizeExecution({ mode: 'scheduled', runAt: 1, sessionReuseMode: 'reuse' }, 0)).toThrow('cron schedule')
+    expect(() => normalizeExecution({ mode: 'scheduled', cron: '* * * * *', reuseSessionId: ' ' }, 0)).toThrow('valid session id')
   })
 })
 
@@ -264,7 +278,7 @@ describe('board settings & default isolation (0.5.0)', () => {
   })
 
   it('asBoardSettings sanitizes; defaultIsolationOf, defaultSyncExternalSessionsOf, and defaultPermissionOf resolve setting → factory', () => {
-    expect(asBoardSettings({ defaultIsolation: 'worktree', syncExternalSessions: true, defaultPermission: 'read-only', junk: 1 })).toEqual({ defaultIsolation: 'worktree', syncExternalSessions: true, defaultPermission: 'read-only' })
+    expect(asBoardSettings({ defaultIsolation: 'worktree', syncExternalSessions: true, defaultPermission: 'read-only', maxConcurrent: 8, scheduleMissedAfterMinutes: 15, queueMaxAgeMinutes: 60, dispatchIntervalMs: 1_500, junk: 1 })).toEqual({ defaultIsolation: 'worktree', syncExternalSessions: true, defaultPermission: 'read-only', maxConcurrent: 8, scheduleMissedAfterMinutes: 15, queueMaxAgeMinutes: 60, dispatchIntervalMs: 1_500 })
     expect(asBoardSettings({ syncExternalSessions: false })).toEqual({ syncExternalSessions: false })
     expect(asBoardSettings({ defaultPermission: 'fullAccess' })).toEqual({ defaultPermission: 'danger-full-access' })
     expect(asBoardSettings({})).toEqual({})
@@ -272,6 +286,12 @@ describe('board settings & default isolation (0.5.0)', () => {
     expect(() => asBoardSettings({ defaultIsolation: 42 })).toThrow("defaultIsolation must be")
     expect(() => asBoardSettings({ syncExternalSessions: 'yes' })).toThrow("syncExternalSessions must be a boolean")
     expect(() => asBoardSettings({ defaultPermission: 'super-user' })).toThrow("permission must be")
+    expect(() => asBoardSettings({ maxConcurrent: 0 })).toThrow('maxConcurrent')
+    expect(() => asBoardSettings({ maxConcurrent: 1.5 })).toThrow('maxConcurrent')
+    expect(() => asBoardSettings({ scheduleMissedAfterMinutes: 0 })).toThrow('scheduleMissedAfterMinutes')
+    expect(() => asBoardSettings({ queueMaxAgeMinutes: -1 })).toThrow('queueMaxAgeMinutes')
+    expect(asBoardSettings({ dispatchIntervalMs: 0 })).toEqual({ dispatchIntervalMs: 0 })
+    expect(() => asBoardSettings({ dispatchIntervalMs: 60_001 })).toThrow('dispatchIntervalMs')
     expect(() => asBoardSettings(null)).toThrow('object')
     expect(defaultIsolationOf(undefined)).toBe('none')
     expect(defaultIsolationOf({})).toBe('none')
@@ -285,6 +305,14 @@ describe('board settings & default isolation (0.5.0)', () => {
     expect(defaultPermissionOf(undefined)).toBe('workspace-write')
     expect(defaultPermissionOf({})).toBe('workspace-write')
     expect(defaultPermissionOf({ defaultPermission: 'read-only' })).toBe('read-only')
+    expect(maxConcurrentOf(undefined)).toBe(3)
+    expect(maxConcurrentOf({ maxConcurrent: 8 })).toBe(8)
+    expect(scheduleMissedAfterMinutesOf(undefined)).toBe(5)
+    expect(scheduleMissedAfterMinutesOf({ scheduleMissedAfterMinutes: 15 })).toBe(15)
+    expect(queueMaxAgeMinutesOf(undefined)).toBe(0)
+    expect(queueMaxAgeMinutesOf({ queueMaxAgeMinutes: 15 })).toBe(15)
+    expect(dispatchIntervalMsOf(undefined)).toBe(1_000)
+    expect(dispatchIntervalMsOf({ dispatchIntervalMs: 1_500 })).toBe(1_500)
   })
 
   it('asPermission normalizes camelCase and kebab-case aliases', () => {
@@ -904,6 +932,19 @@ describe('R4: task id charset gate (import + path building)', () => {
     }
   })
 
+  it('preserves localized system comments through JSON export and import', () => {
+    const comments = [
+      { id: 'c1', body: '中文回退', version: 1, createdAt: 1, systemKey: 'sys.execFailed', systemParams: { error: 'boom' } },
+      { id: 'c2', body: '合并回退', version: 1, createdAt: 2, systemKey: 'sys.mergeMulti', systemRows: [{ repo: '', outcome: 'merged' }, { repo: 'sub', outcome: 'failed', error: 'conflict' }] },
+    ]
+    const result = validateImportedTask(JSON.parse(JSON.stringify({ id: 't-localized', title: 'Test', workspaceId: 'ws-a', comments, executions: [] })), 3)
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.task.comments).toEqual(comments)
+    const invalid = validateImportedTask({ id: 't-invalid', title: 'Test', workspaceId: 'ws-a', executions: [], comments: [{ ...comments[0], systemParams: { error: 42 }, systemRows: [null, { repo: '../escape', outcome: 'merged' }] }] }, 3)
+    expect(invalid.ok).toBe(true)
+    if (invalid.ok) expect(invalid.task.comments[0]).toMatchObject({ systemParams: {}, systemRows: [] })
+  })
+
   it('validateImportedTask rejects traversal-shaped ids at the protocol boundary', () => {
     const base = { title: 'T', workspaceId: 'ws-a', status: 'todo', comments: [], executions: [] }
     // Length alone (the old check) let these into the ledger — they ride
@@ -986,5 +1027,37 @@ describe('mirror protocol additions (0.6.3)', () => {
     // An illegal branches key is silently dropped (legal ones survive).
     const mixed = validateImportedTask({ ...base, branches: { sub: 'task/x', '../evil': 'task/y' } }, 0)
     expect(mixed.ok && mixed.task.branches).toEqual({ sub: 'task/x' })
+  })
+
+  it('taskAssociatedSessionIds extracts execution IDs only, excluding claim and creator', () => {
+    const task: TaskRecord = {
+      id: 't-test-1',
+      title: 'Test',
+      description: '',
+      prompt: '',
+      workspaceId: 'ws-a',
+      urgency: 'normal',
+      status: 'done',
+      blocked: false,
+      execution: { mode: 'claim' },
+      version: 1,
+      createdAt: 0,
+      updatedAt: 0,
+      createdBy: { kind: 'agent', sessionId: 'session-creator-123' },
+      updatedBy: { kind: 'user' },
+      claimedBy: 'session-holder-456',
+      comments: [],
+      executions: [
+        { id: 'e-1', trigger: 'manual', startedAt: 0, outcome: 'succeeded', sessionId: 'session-exec-1' },
+        { id: 'e-2', trigger: 'manual', startedAt: 10, outcome: 'succeeded', sessionId: 'session-exec-2' },
+        { id: 'e-3', trigger: 'manual', startedAt: 20, outcome: 'succeeded', sessionId: 'session-exec-1' }, // duplicate
+      ],
+    }
+    const sessionIds = taskAssociatedSessionIds(task)
+    expect(sessionIds).toEqual(['session-exec-1', 'session-exec-2'])
+
+    // Empty when task has no sessions
+    const emptyTask = { ...task, createdBy: { kind: 'user' as const }, claimedBy: undefined, executions: [] }
+    expect(taskAssociatedSessionIds(emptyTask)).toEqual([])
   })
 })

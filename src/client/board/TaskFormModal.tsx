@@ -1,17 +1,17 @@
 /**
  * The task form modal — create and edit in one polished dialog: header with
  * icon / subtitle / close, a sectioned field grid (title, project, model,
- * urgency tri-picker with hints, description, prompt, execution-mode
+ * urgency and permission selects, description, prompt, execution-mode
  * segmented picker, cron with presets and a live next-run preview), and a
- * footer bar carrying the validation hint and the actions. Esc closes;
- * the title input is focused on open.
+ * footer bar carrying the validation hint and the actions. The title input
+ * is focused on open; Escape, close and cancel dismiss the dialog.
  *
  * @module dsh-taskboard/client/board/TaskFormModal
  */
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import type { BoardController } from '../controller.ts'
 import type { TaskTemplateSpec } from '../../shared/api.ts'
-import type { ChecklistItem, IsolationMode, PermissionMode, TaskRecord, Urgency } from '../../shared/protocol.ts'
+import type { ChecklistItem, IsolationMode, PermissionMode, PeriodicCompletion, TaskRecord, Urgency } from '../../shared/protocol.ts'
 import { MAX_CHECKLIST_ITEMS, asPermission, defaultIsolationOf, defaultPermissionOf, nextCronTime, parseCron } from '../../shared/protocol.ts'
 import { fmtTime } from './format.ts'
 import { useT, type Translate } from '../i18n/runtime.ts'
@@ -64,11 +64,11 @@ export function saveLastModel(model?: { provider: string; model: string; reasoni
   } catch { /* storage unavailable */ }
 }
 
-/** Urgency segmented options with a one-line hint each (translated per render). */
-const urgencyOptions = (t: Translate): ReadonlyArray<{ value: Urgency; label: string; hint: string }> => [
-  { value: 'urgent', label: t('form.urgency.urgent'), hint: t('form.urgency.urgentHint') },
-  { value: 'normal', label: t('form.urgency.normal'), hint: t('form.urgency.normalHint') },
-  { value: 'relaxed', label: t('form.urgency.relaxed'), hint: t('form.urgency.relaxedHint') },
+/** Urgency options (translated per render). */
+const urgencyOptions = (t: Translate): ReadonlyArray<{ value: Urgency; label: string }> => [
+  { value: 'urgent', label: t('form.urgency.urgent') },
+  { value: 'normal', label: t('form.urgency.normal') },
+  { value: 'relaxed', label: t('form.urgency.relaxed') },
 ]
 
 /** Cron presets offered in the scheduled mode (translated per render). */
@@ -80,10 +80,10 @@ const cronPresets = (t: Translate): ReadonlyArray<{ label: string; cron: string 
 ]
 
 /** Permission presets aligned with DSH (translated per render). */
-const permissionOptions = (t: Translate): ReadonlyArray<{ value: PermissionMode; label: string; hint: string; icon: string }> => [
-  { value: 'workspace-write', label: t('form.perm.write'), hint: t('form.perm.writeHint'), icon: '📁' },
-  { value: 'read-only', label: t('form.perm.readOnly'), hint: t('form.perm.readOnlyHint'), icon: '🔒' },
-  { value: 'danger-full-access', label: t('form.perm.fullAccess'), hint: t('form.perm.fullAccessHint'), icon: '⚡' },
+const permissionOptions = (t: Translate): ReadonlyArray<{ value: PermissionMode; label: string; icon: string }> => [
+  { value: 'workspace-write', label: t('form.perm.write'), icon: '📁' },
+  { value: 'read-only', label: t('form.perm.readOnly'), icon: '🔒' },
+  { value: 'danger-full-access', label: t('form.perm.fullAccess'), icon: '⚡' },
 ]
 
 /** Field shell: label + control, optionally spanning the full grid row. */
@@ -178,8 +178,34 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
   const [prompt, setPrompt] = useState(task?.prompt ?? prefill?.prompt ?? '')
   const [workspaceId, setWorkspaceId] = useState(task?.workspaceId ?? state.filters.workspaceId ?? state.workspaces[0]?.id ?? '')
   const [urgency, setUrgency] = useState<Urgency>(task?.urgency ?? (prefill?.urgency === 'urgent' || prefill?.urgency === 'relaxed' ? prefill.urgency : 'normal'))
-  const [mode, setMode] = useState<'claim' | 'scheduled'>(task?.execution.mode === 'scheduled' || prefill?.execution?.mode === 'scheduled' ? 'scheduled' : 'claim')
+  const initExec = task?.execution ?? prefill?.execution
+  const [mode, setMode] = useState<'claim' | 'once' | 'periodic'>(
+    initExec?.mode === 'scheduled' ? (initExec.cron !== undefined ? 'periodic' : 'once') : 'claim',
+  )
   const [cron, setCron] = useState(task?.execution.cron ?? prefill?.execution?.cron ?? '0 9 * * *')
+  const [periodicCompletion, setPeriodicCompletion] = useState<PeriodicCompletion>(
+    task?.execution.periodicCompletion ?? prefill?.execution?.periodicCompletion ?? 'spawn',
+  )
+  type SessionChoice = 'fresh' | 'reuse' | `selected:${string}`
+  const initialSessionChoice: SessionChoice = task?.execution.reuseSessionId !== undefined
+    ? `selected:${task.execution.reuseSessionId}`
+    // Existing tasks without a policy kept #26's auto-reuse behavior.
+    : task !== undefined ? (task.execution.sessionReuseMode ?? 'reuse')
+      : prefill?.execution?.reuseSessionId !== undefined ? `selected:${prefill.execution.reuseSessionId}`
+        : prefill?.execution?.sessionReuseMode ?? 'fresh'
+  const [sessionChoice, setSessionChoice] = useState<SessionChoice>(initialSessionChoice)
+  const [projectSessions, setProjectSessions] = useState<Array<{ id: string; title?: string }>>([])
+  const [sessionsLoading, setSessionsLoading] = useState(false)
+  const [sessionsError, setSessionsError] = useState(false)
+  // One-shot trigger (定时执行): datetime-local string; '' = unset.
+  const initRunAt = initExec?.mode === 'scheduled' && initExec.runAt !== undefined ? initExec.runAt : undefined
+  const [runAt, setRunAt] = useState(() => {
+    if (initRunAt === undefined) return ''
+    const d = new Date(initRunAt)
+    if (Number.isNaN(d.getTime())) return ''
+    const pad = (n: number): string => String(n).padStart(2, '0')
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+  })
   const [catalog, setCatalog] = useState<CatalogModel[]>([])
 
   // Model & reasoning effort selection:
@@ -212,8 +238,9 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
   // create/update/run round-trip is pending — a double click used to fire
   // duplicate creates (and runs) before the first one returned (review P0).
   const [busy, setBusy] = useState(false)
+  const [imageUploading, setImageUploading] = useState(false)
 
-  // Focus the title and close on Esc while the dialog is open.
+  // Focus the title on open; Escape closes the form, while backdrop clicks do not.
   useEffect(() => {
     titleRef.current?.focus()
     const onKey = (e: KeyboardEvent): void => {
@@ -227,6 +254,19 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
   useEffect(() => {
     void controller.fetchModelCatalog().then(setCatalog).catch(() => setCatalog([]))
   }, [controller])
+
+  useEffect(() => {
+    if (workspaceId === '') return
+    let active = true
+    setSessionsLoading(true)
+    setSessionsError(false)
+    void controller.fetchProjectSessions(workspaceId).then(sessions => {
+      if (active) setProjectSessions(sessions)
+    }).catch(() => {
+      if (active) { setProjectSessions([]); setSessionsError(true) }
+    }).finally(() => { if (active) setSessionsLoading(false) })
+    return () => { active = false }
+  }, [controller, workspaceId])
 
   // Preset roster: query runtime or fallback to host API; pre-select the deployment default in
   // create mode (unless a template pinned one) so executions run with a
@@ -244,10 +284,26 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
   }, [controller, editing, task?.presetId, initialPreset])
 
   // Live cron validation + next-run preview (same math as the host).
-  const cronMatch = mode === 'scheduled' ? parseCron(cron.trim()) : null
+  const cronMatch = mode === 'periodic' ? parseCron(cron.trim()) : null
   const nextRun = cronMatch !== null ? nextCronTime(cronMatch, Date.now()) : null
-  const cronBad = mode === 'scheduled' && (cronMatch === null || nextRun === null)
-  const valid = title.trim().length > 0 && workspaceId !== '' && !cronBad
+  const cronBad = mode === 'periodic' && (cronMatch === null || nextRun === null)
+  const runAtMs = mode === 'once' && runAt !== '' ? new Date(runAt).getTime() : NaN
+  const runAtBad = mode === 'once' && (runAt === '' || Number.isNaN(runAtMs) || runAtMs <= Date.now())
+  const valid = title.trim().length > 0 && workspaceId !== '' && !cronBad && !runAtBad
+    && (mode === 'claim' || !sessionChoice.startsWith('selected:') || (!sessionsLoading && projectSessions.some(s => s.id === sessionChoice.slice('selected:'.length))))
+
+  /** Execution payload for submit: claim | periodic (cron) | one-shot (runAt ISO). */
+  const executionPayload = (): { mode: 'claim' | 'scheduled'; cron?: string; runAt?: string; periodicCompletion?: PeriodicCompletion; reuseSessionId?: string; sessionReuseMode?: 'fresh' | 'reuse' } => {
+    const reuse = sessionChoice.startsWith('selected:')
+      ? { reuseSessionId: sessionChoice.slice('selected:'.length) }
+      : { sessionReuseMode: sessionChoice === 'reuse' ? 'reuse' as const : 'fresh' as const }
+    if (mode === 'periodic') return { mode: 'scheduled', cron: cron.trim(), periodicCompletion, ...reuse }
+    // A one-shot task has no later trigger to reuse. Preserve its original
+    // contract: new conversation by default, or one explicit project session.
+    if (mode === 'once') return { mode: 'scheduled', runAt: new Date(runAt).toISOString(),
+      ...(sessionChoice.startsWith('selected:') ? { reuseSessionId: sessionChoice.slice('selected:'.length) } : {}) }
+    return { mode: 'claim' }
+  }
 
   // A task already in progress cannot be run again (host rejects it).
   const runBlocked = editing && task.status === 'in_progress'
@@ -294,7 +350,7 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
   }
 
   const submit = (): void => {
-    if (!valid || busy) return
+    if (!valid || busy || imageUploading) return
     const picked = buildPickedModel()
     if (!editing) saveLastModel(picked)
     const isolationOut = isolationPayload()
@@ -308,7 +364,7 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
         prompt,
         urgency,
         workspaceId,
-        execution: mode === 'scheduled' ? { mode, cron: cron.trim() } : { mode },
+        execution: executionPayload(),
         // '' in edit mode clears the pinned model back to the default.
         model: picked ?? null,
         ...(isolationOut !== undefined && !isolationLocked ? { isolation: isolationOut } : {}),
@@ -323,7 +379,7 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
         urgency,
         description: description.length > 0 ? description : undefined,
         prompt: prompt.length > 0 ? prompt : undefined,
-        execution: mode === 'scheduled' ? { mode, cron: cron.trim() } : { mode },
+        execution: executionPayload(),
         model: picked,
         ...(isolationOut !== undefined ? { isolation: isolationOut } : {}),
         ...(presetOut !== undefined ? { presetId: presetOut } : {}),
@@ -335,7 +391,7 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
 
   /** Save the form, then immediately trigger a manual run of the task. */
   const submitAndRun = (): void => {
-    if (!valid || runBlocked || busy) return
+    if (!valid || runBlocked || busy || imageUploading) return
     const picked = buildPickedModel()
     if (!editing) saveLastModel(picked)
     const isolationOut = isolationPayload()
@@ -350,7 +406,7 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
           prompt,
           urgency,
           workspaceId,
-          execution: mode === 'scheduled' ? { mode, cron: cron.trim() } : { mode },
+          execution: executionPayload(),
           model: picked ?? null,
           ...(isolationOut !== undefined && !isolationLocked ? { isolation: isolationOut } : {}),
           presetId: presetOut ?? null,
@@ -365,7 +421,7 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
           urgency,
           description: description.length > 0 ? description : undefined,
           prompt: prompt.length > 0 ? prompt : undefined,
-          execution: mode === 'scheduled' ? { mode, cron: cron.trim() } : { mode },
+          execution: executionPayload(),
           model: picked,
           ...(isolationOut !== undefined ? { isolation: isolationOut } : {}),
           ...(presetOut !== undefined ? { presetId: presetOut } : {}),
@@ -378,15 +434,21 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
   }
 
   const hint = !valid
-    ? (title.trim().length === 0 ? t('form.hint.needTitle') : workspaceId === '' ? t('form.hint.needProject') : t('form.hint.cronBad'))
-    : mode === 'scheduled' && nextRun !== null
+    ? (title.trim().length === 0
+        ? t('form.hint.needTitle')
+        : workspaceId === ''
+          ? t('form.hint.needProject')
+          : runAtBad ? t('form.hint.runAtBad') : t('form.hint.cronBad'))
+    : mode === 'periodic' && nextRun !== null
       ? t('form.hint.nextRun', { time: fmtTime(nextRun) })
+      : mode === 'once' && !Number.isNaN(runAtMs)
+        ? t('form.hint.onceAt', { time: fmtTime(runAtMs) })
       : editing
         ? t('form.hint.saveVersion', { v: task.version, next: task.version + 1 })
         : t('form.hint.createClaim')
 
   return (
-    <div className="dsh-atb-modal-backdrop" onClick={e => { if (e.target === e.currentTarget) controller.closeForm() }}>
+    <div className="dsh-atb-modal-backdrop">
       <div className="dsh-atb-modal dsh-atb-taskform-modal" data-mode={editing ? 'edit' : 'create'} role="dialog" aria-modal="true" aria-label={editing ? t('form.title.edit') : t('form.title.create')}>
         <div className="dsh-atb-modal-head">
           <span className="dsh-atb-modal-headicon">{editing ? '✎' : '✚'}</span>
@@ -406,7 +468,7 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
 
             <div className="dsh-atb-form-subgrid">
               <Field label={t('form.field.project')} required>
-                <select value={workspaceId} onChange={e => setWorkspaceId(e.target.value)}>
+                <select value={workspaceId} onChange={e => { setWorkspaceId(e.target.value); setSessionChoice('fresh'); setProjectSessions([]) }}>
                   {state.workspaces.map(ws => <option key={ws.id} value={ws.id}>{ws.title || ws.path}</option>)}
                 </select>
               </Field>
@@ -479,77 +541,116 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
               )}
             </div>
 
-            <Field label={t('form.field.urgency')} full>
-              <div className="dsh-atb-urgency-picker">
-                {urgencyOptions(t).map(o => (
-                  <button
-                    key={o.value}
-                    type="button"
-                    className="dsh-atb-urgency-opt"
-                    data-urgency={o.value}
-                    data-on={urgency === o.value}
-                    onClick={() => setUrgency(o.value)}
-                  >
-                    <span className="dsh-atb-urgency-name"><span className="dsh-atb-dot" data-urgency={o.value} />{o.label}</span>
-                    <span className="dsh-atb-urgency-hint">{o.hint}</span>
-                  </button>
-                ))}
-              </div>
-            </Field>
-
-            <Field label={t('form.field.permission')} full>
-              <div className="dsh-atb-perm-picker">
-                {permissionOptions(t).map(opt => (
-                  <button
-                    key={opt.value}
-                    type="button"
-                    className="dsh-atb-perm-opt"
-                    data-on={permission === opt.value}
-                    onClick={() => setPermission(opt.value)}
-                  >
-                    <span className="dsh-atb-perm-name">{opt.icon} {opt.label}{opt.value === 'workspace-write' ? t('form.perm.defaultTag') : ''}</span>
-                    <span className="dsh-atb-perm-hint">{opt.hint}</span>
-                  </button>
-                ))}
-              </div>
-            </Field>
+            <div className="dsh-atb-form-subgrid">
+              <Field label={t('form.field.permission')}>
+                <select className="dsh-atb-permission-select" value={permission} onChange={e => setPermission(asPermission(e.target.value))}>
+                  {permissionOptions(t).map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.icon} {opt.label}{opt.value === 'workspace-write' ? t('form.perm.defaultTag') : ''}</option>
+                  ))}
+                </select>
+              </Field>
+              <Field label={t('form.field.urgency')}>
+                <select className="dsh-atb-urgency-select" value={urgency} onChange={e => setUrgency(e.target.value as Urgency)}>
+                  {urgencyOptions(t).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+              </Field>
+            </div>
 
             <Field label={t('form.field.mode')} full>
-              <div className="dsh-atb-mode-picker">
+              <div className="dsh-atb-mode-picker" data-exec="true">
                 <button type="button" className="dsh-atb-mode-opt" data-on={mode === 'claim'} onClick={() => setMode('claim')}>
                   <span className="dsh-atb-mode-name">{t('form.mode.claim')}</span>
                   <span className="dsh-atb-mode-hint">{t('form.mode.claimHint')}</span>
                 </button>
-                <button type="button" className="dsh-atb-mode-opt" data-on={mode === 'scheduled'} onClick={() => setMode('scheduled')}>
-                  <span className="dsh-atb-mode-name">{t('form.mode.scheduled')}</span>
-                  <span className="dsh-atb-mode-hint">{t('form.mode.scheduledHint')}</span>
+                <button type="button" className="dsh-atb-mode-opt" data-on={mode === 'once'} onClick={() => setMode('once')}>
+                  <span className="dsh-atb-mode-name">{t('form.mode.once')}</span>
+                  <span className="dsh-atb-mode-hint">{t('form.mode.onceHint')}</span>
+                </button>
+                <button type="button" className="dsh-atb-mode-opt" data-on={mode === 'periodic'} onClick={() => setMode('periodic')}>
+                  <span className="dsh-atb-mode-name">{t('form.mode.periodic')}</span>
+                  <span className="dsh-atb-mode-hint">{t('form.mode.periodicHint')}</span>
                 </button>
               </div>
             </Field>
 
-            {mode === 'scheduled' && (
-              <Field label={t('form.field.cron')} required full>
+            {mode === 'once' && (
+              <Field label={t('form.field.runAt')} required full>
                 <input
-                  className={cronBad ? 'dsh-atb-input-bad' : undefined}
-                  value={cron}
-                  onChange={e => setCron(e.target.value)}
-                  placeholder={t('form.cron.placeholder')}
+                  type="datetime-local"
+                  className={runAtBad ? 'dsh-atb-input-bad' : undefined}
+                  value={runAt}
+                  onChange={e => setRunAt(e.target.value)}
                   spellCheck={false}
                 />
-                <span className="dsh-atb-cron-presets">
-                  {cronPresets(t).map(p => (
-                    <button
-                      key={p.cron}
-                      type="button"
-                      className="dsh-atb-cron-preset"
-                      data-on={cron.trim() === p.cron}
-                      onClick={() => setCron(p.cron)}
-                    >
-                      {p.label}
+              </Field>
+            )}
+
+            {mode === 'periodic' && (
+              <>
+                <Field label={t('form.field.cron')} required full>
+                  <input
+                    className={cronBad ? 'dsh-atb-input-bad' : undefined}
+                    value={cron}
+                    onChange={e => setCron(e.target.value)}
+                    placeholder={t('form.cron.placeholder')}
+                    spellCheck={false}
+                  />
+                  <span className="dsh-atb-cron-presets">
+                    {cronPresets(t).map(p => (
+                      <button
+                        key={p.cron}
+                        type="button"
+                        className="dsh-atb-cron-preset"
+                        data-on={cron.trim() === p.cron}
+                        onClick={() => setCron(p.cron)}
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                    {!cronBad && nextRun !== null && <span className="dsh-atb-cron-next">{t('form.cron.next', { time: fmtTime(nextRun) })}</span>}
+                  </span>
+                </Field>
+                <Field label={t('form.field.periodicCompletion')} full>
+                  <div className="dsh-atb-mode-picker">
+                    <button type="button" className="dsh-atb-mode-opt" data-on={periodicCompletion === 'rearm'} onClick={() => setPeriodicCompletion('rearm')}>
+                      <span className="dsh-atb-mode-name">{t('form.periodicCompletion.rearm')}</span>
+                      <span className="dsh-atb-mode-hint">{t('form.periodicCompletion.rearmHint')}</span>
                     </button>
-                  ))}
-                  {!cronBad && nextRun !== null && <span className="dsh-atb-cron-next">{t('form.cron.next', { time: fmtTime(nextRun) })}</span>}
-                </span>
+                    <button type="button" className="dsh-atb-mode-opt" data-on={periodicCompletion === 'spawn'} onClick={() => setPeriodicCompletion('spawn')}>
+                      <span className="dsh-atb-mode-name">{t('form.periodicCompletion.spawn')}</span>
+                      <span className="dsh-atb-mode-hint">{t('form.periodicCompletion.spawnHint')}</span>
+                    </button>
+                  </div>
+                </Field>
+              </>
+            )}
+
+            {mode === 'periodic' && (
+              <Field label={t('form.field.reuseSession')} full>
+                <select value={sessionChoice} onChange={e => setSessionChoice(e.target.value as SessionChoice)}>
+                  <option value="fresh">{t('form.session.fresh')}</option>
+                  <option value="reuse">{t('form.session.reuse')}</option>
+                  {projectSessions.map(session => <option key={session.id} value={`selected:${session.id}`}>{session.title ?? session.id}</option>)}
+                </select>
+                {sessionsLoading && <span className="dsh-atb-isolation-note">{t('shared.loading')}</span>}
+                {sessionsError && <span className="dsh-atb-isolation-note">{t('form.session.unavailable')}</span>}
+                {!sessionsLoading && !sessionsError && sessionChoice.startsWith('selected:') && !projectSessions.some(session => session.id === sessionChoice.slice('selected:'.length)) && (
+                  <span className="dsh-atb-isolation-note">{t('form.session.missing')}</span>
+                )}
+              </Field>
+            )}
+
+            {mode === 'once' && (
+              <Field label={t('form.field.reuseSession')} full>
+                <select value={sessionChoice.startsWith('selected:') ? sessionChoice : 'fresh'} onChange={e => setSessionChoice(e.target.value === 'fresh' ? 'fresh' : `selected:${e.target.value}`)}>
+                  <option value="fresh">{t('form.session.new')}</option>
+                  {projectSessions.map(session => <option key={session.id} value={session.id}>{session.title ?? session.id}</option>)}
+                </select>
+                {sessionsLoading && <span className="dsh-atb-isolation-note">{t('shared.loading')}</span>}
+                {sessionsError && <span className="dsh-atb-isolation-note">{t('form.session.unavailable')}</span>}
+                {!sessionsLoading && !sessionsError && sessionChoice.startsWith('selected:') && !projectSessions.some(session => session.id === sessionChoice.slice('selected:'.length)) && (
+                  <span className="dsh-atb-isolation-note">{t('form.session.missing')}</span>
+                )}
               </Field>
             )}
 
@@ -602,6 +703,8 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
                 controller={controller}
                 rows={7}
                 placeholder={t('form.desc.placeholder')}
+                allowImages
+                onUploadingChange={setImageUploading}
               />
             </Field>
 
@@ -624,13 +727,13 @@ export function TaskFormModal({ controller, task }: { controller: BoardControlle
             <button
               type="button"
               className="dsh-atb-btn"
-              disabled={!valid || runBlocked || busy}
-              title={runBlocked ? t('form.action.runBlockedTitle') : busy ? t('form.action.runBusyTitle') : t('form.action.runTitle')}
+              disabled={!valid || runBlocked || busy || imageUploading}
+              title={runBlocked ? t('form.action.runBlockedTitle') : busy || imageUploading ? t('form.action.runBusyTitle') : t('form.action.runTitle')}
               onClick={submitAndRun}
             >
               {t('form.action.run')}
             </button>
-            <button type="button" className="dsh-atb-btn" data-primary="true" disabled={!valid || busy} onClick={submit}>
+            <button type="button" className="dsh-atb-btn" data-primary="true" disabled={!valid || busy || imageUploading} onClick={submit}>
               {editing ? t('form.action.save') : t('form.action.create')}
             </button>
           </span>
@@ -650,7 +753,7 @@ interface TaskRecordLike {
   prompt: string
   workspaceId: string
   urgency: Urgency
-  execution: { mode: 'claim' | 'scheduled'; cron?: string }
+  execution: { mode: 'claim' | 'scheduled'; cron?: string; runAt?: number }
   model?: { provider: string; model: string; reasoningEffort?: string }
   isolation?: IsolationMode
   presetId?: string

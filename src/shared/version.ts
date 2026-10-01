@@ -6,4 +6,5 @@
  */
 
 /** The package version (must equal package.json "version"). */
-export const PLUGIN_VERSION = '0.6.5'
+export const PLUGIN_VERSION = '0.8.6'
+

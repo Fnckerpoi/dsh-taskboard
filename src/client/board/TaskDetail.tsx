@@ -7,14 +7,15 @@
  *
  * @module dsh-taskboard/client/board/TaskDetail
  */
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import type { BoardController } from '../controller.ts'
-import type { ExecutionRecord, TaskRecord } from '../../shared/protocol.ts'
-import { canTransition, checklistProgress } from '../../shared/protocol.ts'
+import type { CommentRecord, ExecutionRecord, TaskRecord } from '../../shared/protocol.ts'
+import { canTransition, checklistProgress, taskAssociatedSessionIds } from '../../shared/protocol.ts'
 import { useAlert } from './AlertModal.tsx'
 import { fmtTime, isStaleClaim } from './format.ts'
 import { MOVE_KEYS, OUTCOME_KEYS, STATUS_KEYS, URGENCY_KEYS } from './labels.ts'
-import { useT } from '../i18n/runtime.ts'
+import { useT, type Translate } from '../i18n/runtime.ts'
+import { IMAGE_ACCEPT, acceptedImageFiles, imageAlt, imageMarkdown, insertImageMarkdown } from '../image-insert.ts'
 
 /** Statuses a user may move this task to, per the state machine. */
 function moveTargets(task: TaskRecord): TaskRecord['status'][] {
@@ -26,6 +27,26 @@ function moveTargets(task: TaskRecord): TaskRecord['status'][] {
 function shortId(id: string | undefined): string {
   if (id === undefined) return ''
   return id.replace(/^session-(taskboard-)?/, '').slice(0, 8)
+}
+
+/**
+ * Render a comment body, localizing host-generated system messages (0.6.4).
+ * System comments carry a `systemKey` (+ flat params, or structured per-repo
+ * rows for the multi-repo merge summary); user/agent comments render raw.
+ */
+export function commentBody(t: Translate, c: CommentRecord): string {
+  if (c.systemKey === undefined) return c.body
+  if (c.systemRows !== undefined) {
+    const summary = c.systemRows
+      .map(r => {
+        const label = r.repo === '' ? t('iso.repo.root') : r.repo
+        const mark = r.outcome === 'merged' ? '✓' : r.outcome === 'noop' ? '⟲' : '✗'
+        return r.outcome === 'failed' && r.error !== undefined ? `${label} ${mark} ${r.error}` : `${label} ${mark}`
+      })
+      .join(' · ')
+    return t(c.systemKey, { summary })
+  }
+  return t(c.systemKey, c.systemParams)
 }
 
 /** Execution duration between start and end. */
@@ -494,9 +515,13 @@ function IsolationBlock({ task, controller }: { task: TaskRecord; controller: Bo
 export function TaskDetail({ task, controller, now }: { task: TaskRecord; controller: BoardController; now?: number }) {
   const t = useT()
   const [comment, setComment] = useState('')
+  const [commentUploading, setCommentUploading] = useState(false)
+  const commentRef = useRef<HTMLTextAreaElement>(null)
+  const commentFileRef = useRef<HTMLInputElement>(null)
   const [confirmDone, setConfirmDone] = useState(false)
   const [confirmPurge, setConfirmPurge] = useState(false)
   const [confirmCancel, setConfirmCancel] = useState(false)
+  const [confirmArchive, setConfirmArchive] = useState(false)
   // Top action buttons (duplicate / save-as-template / run / reuse-run)
   // share one in-flight guard: a double click used to fire duplicate runs or
   // copies while the first round-trip was still pending (review P0).
@@ -510,12 +535,51 @@ export function TaskDetail({ task, controller, now }: { task: TaskRecord; contro
   const unchecked = (task.checklist ?? []).filter(i => !i.checked).length
   const sessionExecution = [...task.executions].reverse().find(e => e.sessionId !== undefined)
   const targetSessionId = runningExecution?.sessionId ?? sessionExecution?.sessionId ?? (task.claimedBy?.startsWith('session-') ? task.claimedBy : undefined)
+  const associatedSessions = taskAssociatedSessionIds(task)
+  const archiveState = controller.getSnapshot()
+  const archiveResult = archiveState.sessionArchive?.taskId === task.id ? archiveState.sessionArchive.result : undefined
 
   /** Fire one top action under the shared busy guard; re-enable on settle. */
   const runAction = (action: () => Promise<unknown>): void => {
     if (actionBusy) return
     setActionBusy(true)
     void action().catch(() => undefined).finally(() => setActionBusy(false))
+  }
+
+  const postComment = (): void => {
+    if (commentUploading || comment.trim().length === 0) return
+    void controller.comment(task.id, comment).then(ok => { if (ok) setComment('') })
+  }
+
+  const uploadCommentImages = async (rawFiles: Iterable<File>): Promise<void> => {
+    const files = acceptedImageFiles(rawFiles)
+    if (files.length === 0 || commentUploading) return
+    setCommentUploading(true)
+    const element = commentRef.current
+    let nextValue = element?.value ?? comment
+    let start = element?.selectionStart ?? nextValue.length
+    let end = element?.selectionEnd ?? start
+    let changed = false
+    try {
+      for (const file of files) {
+        const asset = await controller.uploadImage(file)
+        if (asset === undefined) continue
+        const next = insertImageMarkdown(nextValue, start, end, imageMarkdown(asset, imageAlt(file.name, t('image.defaultAlt'))))
+        nextValue = next.value
+        start = next.cursor
+        end = start
+        changed = true
+      }
+      if (changed) {
+        setComment(nextValue)
+        setTimeout(() => {
+          commentRef.current?.focus()
+          commentRef.current?.setSelectionRange(start, start)
+        }, 0)
+      }
+    } finally {
+      setCommentUploading(false)
+    }
   }
 
   /** Jump to an execution's session; prompt precisely when it cannot open. */
@@ -550,6 +614,7 @@ export function TaskDetail({ task, controller, now }: { task: TaskRecord; contro
             {task.execution.mode === 'scheduled' && (
               <Chip icon="⏰">{t('detail.chip.nextRun', { cron: task.execution.cron ?? '', time: fmtTime(task.execution.nextRunAt) })}</Chip>
             )}
+            {task.execution.queuedRunAt !== undefined && <Chip icon="⏳" tone="urgent">{t('detail.chip.queuedRun', { time: fmtTime(task.execution.queuedRunAt) })}</Chip>}
             {task.blocked && <Chip icon="⛔" tone="urgent">{t('shared.blocked')}</Chip>}
             {task.checklist !== undefined && task.checklist.length > 0 && (
               <Chip icon="☑" tone={task.status === 'in_review' && task.checklist.some(i => !i.checked) ? 'urgent' : undefined}>
@@ -680,10 +745,21 @@ export function TaskDetail({ task, controller, now }: { task: TaskRecord; contro
 
       <ChecklistBlock task={task} controller={controller} />
 
+      {archiveResult !== undefined && (
+        <div role="status" className="dsh-atb-confirm">
+          <span>{t('detail.move.archiveResult', { n: archiveResult.archived.length })}</span>
+          {archiveResult.failed.map(item => <span key={item.sessionId}>{item.sessionId}: {item.error}</span>)}
+          {archiveResult.unsupported.length > 0 && <span>{t('detail.move.archiveUnsupported')} {archiveResult.unsupported.join(', ')}</span>}
+        </div>
+      )}
+      {task.status === 'archived' && associatedSessions.length > 0 && archiveState.archiveSessionsSupported && (
+        <button type="button" className="dsh-atb-btn" disabled={actionBusy} onClick={() => runAction(() => controller.retryArchiveSessions(task.id))}>{t('detail.move.archiveRetry')}</button>
+      )}
       <div className="dsh-atb-detail-actions">
         <div className="dsh-atb-movebtns">
-          {moveTargets(task).map(to => to === 'done'
-            ? (confirmDone
+          {moveTargets(task).map(to => {
+            if (to === 'done') {
+              return confirmDone
                 ? (
                     <span key={to} className="dsh-atb-confirm">
                       <span className="dsh-atb-confirm-label" data-tone={unchecked > 0 ? 'bad' : undefined}>
@@ -693,12 +769,83 @@ export function TaskDetail({ task, controller, now }: { task: TaskRecord; contro
                       <button type="button" className="dsh-atb-btn" onClick={() => setConfirmDone(false)}>{t('shared.cancel')}</button>
                     </span>
                   )
-                : <button key={to} type="button" className="dsh-atb-movebtn" data-to={to} onClick={() => setConfirmDone(true)}>{t('detail.move.to', { status: t(MOVE_KEYS[to]) })}</button>)
-            : (
-                <button key={to} type="button" className="dsh-atb-movebtn" data-to={to} onClick={() => void controller.move(task.id, task.version, to)}>
+                : <button key={to} type="button" className="dsh-atb-movebtn" data-to={to} onClick={() => { setConfirmDone(true); setConfirmArchive(false) }}>{t('detail.move.to', { status: t(MOVE_KEYS[to]) })}</button>
+            }
+            if (to === 'archived') {
+              if (confirmArchive) {
+                return (
+                  <span key={to} className="dsh-atb-confirm">
+                    <span className="dsh-atb-confirm-label">
+                      {associatedSessions.length === 1
+                        ? t('detail.move.confirmArchiveSessionWithId', { id: shortId(associatedSessions[0]) })
+                        : associatedSessions.length > 1
+                          ? t('detail.move.confirmArchiveSessionCount', { n: associatedSessions.length })
+                          : t('detail.move.confirmArchive')}
+                    </span>
+                    {associatedSessions.length > 0 && <span className="dsh-atb-confirm-label">{associatedSessions.join(', ')}</span>}
+                    {associatedSessions.length > 0 ? (
+                      <>
+                        <button
+                          type="button"
+                          className="dsh-atb-btn"
+                          disabled={!archiveState.archiveSessionsSupported || actionBusy}
+                          title={!archiveState.archiveSessionsSupported ? t('detail.move.archiveUnsupported') : undefined}
+                          onClick={() => {
+                            runAction(() => controller.move(task.id, task.version, 'archived', { archiveSessions: true }))
+                            setConfirmArchive(false)
+                          }}
+                        >
+                          {t('detail.move.archiveWithSession')}
+                        </button>
+                        <button
+                          type="button"
+                          className="dsh-atb-btn"
+                          onClick={() => {
+                            runAction(() => controller.move(task.id, task.version, 'archived', { archiveSessions: false }))
+                            setConfirmArchive(false)
+                          }}
+                        >
+                          {t('detail.move.archiveCardOnly')}
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="dsh-atb-btn"
+                        data-primary="true"
+                        onClick={() => {
+                          void controller.move(task.id, task.version, 'archived')
+                          setConfirmArchive(false)
+                        }}
+                      >
+                        {t('detail.move.confirm')}
+                      </button>
+                    )}
+                    <button type="button" className="dsh-atb-btn" onClick={() => setConfirmArchive(false)}>{t('shared.cancel')}</button>
+                  </span>
+                )
+              }
+              return (
+                <button
+                  key={to}
+                  type="button"
+                  className="dsh-atb-movebtn"
+                  data-to={to}
+                  onClick={() => {
+                    setConfirmArchive(true)
+                    setConfirmDone(false)
+                  }}
+                >
                   {t('detail.move.to', { status: t(MOVE_KEYS[to]) })}
                 </button>
-              ))}
+              )
+            }
+            return (
+              <button key={to} type="button" className="dsh-atb-movebtn" data-to={to} onClick={() => void controller.move(task.id, task.version, to)}>
+                {t('detail.move.to', { status: t(MOVE_KEYS[to]) })}
+              </button>
+            )
+          })}
           <button type="button" className="dsh-atb-movebtn" data-to="blocked" onClick={() => void controller.toggleBlocked(task)}>
             {task.blocked ? t('detail.blocked.unmark') : t('detail.blocked.mark')}
           </button>
@@ -730,7 +877,7 @@ export function TaskDetail({ task, controller, now }: { task: TaskRecord; contro
                         <b>{c.threadId !== undefined ? `agent ${shortId(c.threadId)}` : t('detail.comments.user')}</b>
                         <span>{fmtTime(c.createdAt)}</span>
                       </div>
-                      <div className="dsh-atb-bubble-body">{c.body}</div>
+                      <div className="dsh-atb-bubble-body"><MarkdownContent text={commentBody(t, c)} /></div>
                     </div>
                   </div>
                 ))}
@@ -738,24 +885,47 @@ export function TaskDetail({ task, controller, now }: { task: TaskRecord; contro
             )}
         <div className="dsh-atb-composer">
           <textarea
+            ref={commentRef}
             className="dsh-atb-composer-input"
             value={comment}
             placeholder={t('detail.composer.placeholder')}
+            disabled={commentUploading}
             onChange={e => setComment(e.target.value)}
             onKeyDown={e => {
-              if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && comment.trim().length > 0) {
+              if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && comment.trim().length > 0 && !commentUploading) {
                 // T13: keep the draft when the post fails (reject 表单同样保留).
-                void controller.comment(task.id, comment).then(ok => { if (ok) setComment('') })
+                postComment()
               }
             }}
+            onPaste={e => {
+              const files = acceptedImageFiles(e.clipboardData.files)
+              if (files.length > 0) { e.preventDefault(); void uploadCommentImages(files) }
+            }}
+            onDragOver={e => { if (e.dataTransfer.types.includes('Files')) e.preventDefault() }}
+            onDrop={e => {
+              const files = acceptedImageFiles(e.dataTransfer.files)
+              if (files.length > 0) { e.preventDefault(); void uploadCommentImages(files) }
+            }}
           />
+          <input
+            ref={commentFileRef}
+            type="file"
+            accept={IMAGE_ACCEPT}
+            multiple
+            hidden
+            onChange={e => {
+              if (e.target.files !== null) void uploadCommentImages(e.target.files)
+              e.target.value = ''
+            }}
+          />
+          <button type="button" className="dsh-atb-image-add" disabled={commentUploading} title={t('image.add')} onClick={() => commentFileRef.current?.click()}>
+            {commentUploading ? '…' : '🖼'}
+          </button>
           <button
             type="button"
             className="dsh-atb-composer-send"
-            disabled={comment.trim().length === 0}
-            onClick={() => {
-              void controller.comment(task.id, comment).then(ok => { if (ok) setComment('') })
-            }}
+            disabled={comment.trim().length === 0 || commentUploading}
+            onClick={postComment}
           >
             {t('detail.composer.send')}
           </button>

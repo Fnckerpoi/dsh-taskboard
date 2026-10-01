@@ -529,14 +529,19 @@ describe('client half', () => {
     const { SettingsModal } = await import('../src/client/board/SettingsModal.tsx')
 
     const saved: unknown[] = []
+    const migrated: string[] = []
     const client = {
       state: async () => ({ schemaVersion: 1, revision: 1, tasks: [], settings: { defaultIsolation: 'worktree' } }),
       workspaces: async () => [],
       stream: () => () => {},
       updateSettings: async (body: unknown) => { saved.push(body); return body },
+      storage: async () => ({ currentDirectory: 'C:\\old', defaultDirectory: 'C:\\old', isDefault: true, configured: false, writable: true, assetCount: 2, assetBytes: 1024 }),
+      checkStorage: async (directory: string) => ({ currentDirectory: 'C:\\old', defaultDirectory: 'C:\\old', isDefault: true, configured: false, writable: true, assetCount: 2, assetBytes: 1024, checkedDirectory: directory }),
+      migrateStorage: async (directory: string) => { migrated.push(directory); return { currentDirectory: directory, defaultDirectory: 'C:\\old', isDefault: false, configured: true, writable: true, assetCount: 2, assetBytes: 1024, migrated: true, warnings: [] } },
     }
     const controller = new BoardController(client as never)
     controller.start()
+    controller.openSettings()
     await new Promise(r => setTimeout(r, 10))
 
     const host = document.createElement('div')
@@ -570,7 +575,29 @@ describe('client half', () => {
     expect(saveBtn().disabled).toBe(false)
     saveBtn().click()
     await new Promise(r => setTimeout(r, 20))
-    expect(saved).toEqual([{ defaultIsolation: 'none', syncExternalSessions: true, defaultPermission: 'workspace-write' }])
+    expect(saved).toEqual([{
+      defaultIsolation: 'none',
+      syncExternalSessions: true,
+      defaultPermission: 'workspace-write',
+      maxConcurrent: 3,
+      scheduleMissedAfterMinutes: 5,
+      queueMaxAgeMinutes: 0,
+      dispatchIntervalMs: 1_000,
+    }])
+
+    const storageInput = host.querySelector<HTMLInputElement>('.dsh-atb-storage-path')!
+    expect(storageInput.value).toBe('C:\\old')
+    const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
+    valueSetter.call(storageInput, 'D:\\taskboard-data')
+    storageInput.dispatchEvent(new Event('input', { bubbles: true }))
+    await new Promise(r => setTimeout(r, 10))
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const migrateBtn = Array.from(host.querySelectorAll<HTMLButtonElement>('.dsh-atb-btn')).find(b => b.textContent === '迁移数据')!
+    expect(migrateBtn.disabled).toBe(false)
+    migrateBtn.click()
+    await new Promise(r => setTimeout(r, 20))
+    expect(migrated).toEqual(['D:\\taskboard-data'])
+    confirm.mockRestore()
 
     root.unmount()
     host.remove()
@@ -833,6 +860,47 @@ describe('client half', () => {
     controller.dispose()
   })
 
+  // Regression guard for the DSH 0.1.7 runtime shape: the runtime's sessions
+  // service no longer carries `open()` (0.1.5 had one, 0.1.6+ removed it —
+  // "navigation belongs to view owners"). The documented navigation entry is
+  // uiWorkspace.openSession(); reading a missing `sessions.open` throws inside
+  // the jumper's try, so a runtime-shaped sessions service must still open.
+  it('session jump opens through the navigation service when sessions has no open()', async () => {
+    const { BoardController } = await import('../src/client/controller.ts')
+    const { createSessionJumper } = await import('../src/client/session-jump.ts')
+
+    const client = {
+      state: async () => ({ schemaVersion: 1, revision: 1, tasks: [] }),
+      workspaces: async () => [],
+      stream: () => () => {},
+    }
+    const controller = new BoardController(client as never)
+    controller.openBoard()
+
+    // Runtime-shaped services: probe-clean, no `open` key at all.
+    const sessions = {
+      refresh: async () => {},
+      list: { getSnapshot: () => ({ byId: { 's-live': {} } }) },
+    }
+    const workspaces = { list: { getSnapshot: () => ({ archivedSessionIds: [] as string[] }) } }
+    const navigated: string[] = []
+    const uiWorkspace = { openSession: (id: string) => { navigated.push(id) } }
+
+    controller.installSessionJumper(createSessionJumper({
+      getSessions: () => sessions as never,
+      getWorkspaces: () => workspaces as never,
+      getUiWorkspace: () => uiWorkspace as never,
+    }))
+
+    // The jump must not degrade to 'unavailable' on this runtime, and the
+    // board must close over the session it navigated to.
+    expect(await controller.openSession('s-live')).toBe('opened')
+    expect(navigated).toEqual(['s-live'])
+    expect(controller.getSnapshot().boardOpen).toBe(false)
+
+    controller.dispose()
+  })
+
   it('controller: search filter, urgency sort, and persisted view state', async () => {
     localStorage.clear()
     const { BoardController } = await import('../src/client/controller.ts')
@@ -1061,6 +1129,119 @@ describe('client half', () => {
     doneBtn.click()
     await new Promise(r => setTimeout(r, 10))
     expect(host.querySelector('.dsh-atb-confirm-label')!.textContent).toContain('仍有 1 项清单未勾选')
+
+    root.unmount()
+    host.remove()
+    controller.dispose()
+    localStorage.clear()
+  })
+
+  it('detail: archive move with associated session prompts for confirmation and supports archive with session vs card only', async () => {
+    localStorage.clear()
+    const React = await import('react')
+    const { createRoot } = await import('react-dom/client')
+    const { BoardController } = await import('../src/client/controller.ts')
+    const { TaskDetail } = await import('../src/client/board/TaskDetail.tsx')
+
+    const taskWithSession = {
+      id: 't-arch-1', title: '已完成任务', description: '', prompt: '', workspaceId: 'ws-a',
+      urgency: 'normal' as const, status: 'done' as const, blocked: false,
+      execution: { mode: 'claim' as const }, version: 5, createdAt: 0, updatedAt: 0,
+      createdBy: { kind: 'user' as const }, updatedBy: { kind: 'user' as const },
+      comments: [], executions: [{
+        id: 'e-1', trigger: 'manual' as const, startedAt: 0, endedAt: 10, outcome: 'succeeded' as const,
+        sessionId: 'session-taskboard-s1234567',
+      }],
+    }
+    const moves: Array<{ id: string; body: Record<string, unknown> }> = []
+    let archiveSupported = true
+    const client = {
+      state: async () => ({ schemaVersion: 1, revision: 1, tasks: [taskWithSession], capabilities: { archiveSessions: archiveSupported } }),
+      workspaces: async () => [{ id: 'ws-a', path: '/p/a', title: 'A', sessionCount: 0 }],
+      stream: () => () => {},
+      move: async (id: string, body: Record<string, unknown>) => { moves.push({ id, body }); return { ...taskWithSession, ...(body.archiveSessions === true ? { sessionArchive: { archived: [], failed: [{ sessionId: 'session-taskboard-s1234567', error: 'disk failure' }], unsupported: [] } } : {}) } },
+      archiveSessions: async () => ({ archived: ['session-taskboard-s1234567'], failed: [], unsupported: [] }),
+    }
+    const controller = new BoardController(client as never)
+    controller.start()
+    await new Promise(r => setTimeout(r, 10))
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const root = createRoot(host)
+    root.render(React.createElement(TaskDetail, { task: taskWithSession as never, controller, now: 1_000 }))
+    await new Promise(r => setTimeout(r, 10))
+
+    // 1. Initial state: archive move button is rendered
+    const archBtn = host.querySelector<HTMLButtonElement>('.dsh-atb-movebtn[data-to="archived"]')!
+    expect(archBtn).not.toBeNull()
+
+    // 2. Click archive button: should NOT move directly; instead shows confirm prompt with session ID
+    archBtn.click()
+    await new Promise(r => setTimeout(r, 10))
+    expect(moves).toHaveLength(0)
+
+    const confirmLabel = host.querySelector('.dsh-atb-confirm-label')!
+    expect(confirmLabel.textContent).toContain('s1234567')
+
+    const btns = Array.from(host.querySelectorAll<HTMLButtonElement>('.dsh-atb-confirm .dsh-atb-btn'))
+    const withSessionBtn = btns.find(b => b.textContent === '连同会话归档')!
+    const cardOnlyBtn = btns.find(b => b.textContent!.includes('仅归档卡片') || b.textContent!.includes('Card only'))!
+    const cancelBtn = btns.find(b => b.textContent!.includes('取消') || b.textContent!.includes('Cancel'))!
+
+    expect(withSessionBtn).not.toBeNull()
+    expect(withSessionBtn.dataset.primary).toBeUndefined()
+    expect(host.textContent).toContain('session-taskboard-s1234567')
+    expect(cardOnlyBtn).not.toBeNull()
+    expect(cancelBtn).not.toBeNull()
+
+    // 3. Test cancel button
+    cancelBtn.click()
+    await new Promise(r => setTimeout(r, 10))
+    expect(moves).toHaveLength(0)
+    expect(host.querySelector('.dsh-atb-confirm')).toBeNull()
+
+    // 4. Click archive again, then choose "仅归档卡片"
+    const archBtn2 = host.querySelector<HTMLButtonElement>('.dsh-atb-movebtn[data-to="archived"]')!
+    archBtn2.click()
+    await new Promise(r => setTimeout(r, 10))
+
+    const cardOnlyBtn2 = Array.from(host.querySelectorAll<HTMLButtonElement>('.dsh-atb-confirm .dsh-atb-btn'))
+      .find(b => b.textContent!.includes('仅归档卡片') || b.textContent!.includes('Card only'))!
+    cardOnlyBtn2.click()
+    await new Promise(r => setTimeout(r, 10))
+    expect(moves).toEqual([{ id: 't-arch-1', body: { ifVersion: 5, status: 'archived', archiveSessions: false } }])
+
+    // 5. Click archive again, then choose "连同会话归档"
+    moves.length = 0
+    const archBtn3 = host.querySelector<HTMLButtonElement>('.dsh-atb-movebtn[data-to="archived"]')!
+    archBtn3.click()
+    await new Promise(r => setTimeout(r, 10))
+
+    const withSessionBtn3 = Array.from(host.querySelectorAll<HTMLButtonElement>('.dsh-atb-confirm .dsh-atb-btn')).find(b => b.textContent === '连同会话归档')!
+    withSessionBtn3.click()
+    await new Promise(r => setTimeout(r, 10))
+    expect(moves).toEqual([{ id: 't-arch-1', body: { ifVersion: 5, status: 'archived', archiveSessions: true } }])
+
+    root.render(React.createElement(TaskDetail, { task: { ...taskWithSession, status: 'archived' } as never, controller, now: 1_000 }))
+    await new Promise(r => setTimeout(r, 10))
+    expect(host.textContent).toContain('disk failure')
+    const retry = Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find(b => b.textContent!.includes('重试归档'))!
+    retry.click()
+    await new Promise(r => setTimeout(r, 10))
+    expect(controller.getSnapshot().sessionArchive?.result.failed).toEqual([])
+    expect(host.textContent).not.toContain('disk failure')
+    expect(moves).toHaveLength(1) // retry never repeats the terminal transition
+
+    archiveSupported = false
+    await controller.refresh()
+    root.render(React.createElement(TaskDetail, { task: taskWithSession as never, controller, now: 1_000 }))
+    await new Promise(r => setTimeout(r, 10))
+    host.querySelector<HTMLButtonElement>('.dsh-atb-movebtn[data-to="archived"]')!.click()
+    await new Promise(r => setTimeout(r, 10))
+    const unsupported = Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find(b => b.textContent === '连同会话归档')!
+    expect(unsupported.disabled).toBe(true)
+    expect(unsupported.title).toContain('不支持')
 
     root.unmount()
     host.remove()
@@ -1992,7 +2173,7 @@ describe('client half', () => {
     localStorage.clear()
   })
 
-  it('TaskFormModal: supports permission tri-picker and SlashPromptInput (0.5.5)', async () => {
+  it('TaskFormModal: submits urgency and permission selects with SlashPromptInput', async () => {
     localStorage.clear()
     const React = await import('react')
     const { createRoot } = await import('react-dom/client')
@@ -2036,17 +2217,24 @@ describe('client half', () => {
     titleInput.dispatchEvent(new Event('change', { bubbles: true }))
 
     // Check permission options: default is workspace-write
-    const permOpts = Array.from(host.querySelectorAll<HTMLButtonElement>('.dsh-atb-perm-opt'))
+    const permissionSelect = host.querySelector<HTMLSelectElement>('.dsh-atb-permission-select')!
+    const permOpts = Array.from(permissionSelect.options)
     expect(permOpts.length).toBe(3)
     expect(permOpts[0]!.textContent).toContain('可写入工作区')
     expect(permOpts[1]!.textContent).toContain('仅可查看')
     expect(permOpts[2]!.textContent).toContain('完全权限')
-    expect(permOpts[0]!.dataset.on).toBe('true')
+    expect(permissionSelect.value).toBe('workspace-write')
 
-    // Click '仅可查看' (read-only)
-    permOpts[1]!.click()
+    // Select '仅可查看' (read-only) and urgent priority.
+    permissionSelect.value = 'read-only'
+    permissionSelect.dispatchEvent(new Event('change', { bubbles: true }))
+    const urgencySelect = host.querySelector<HTMLSelectElement>('.dsh-atb-urgency-select')!
+    expect(urgencySelect.value).toBe('normal')
+    urgencySelect.value = 'urgent'
+    urgencySelect.dispatchEvent(new Event('change', { bubbles: true }))
     await new Promise(r => setTimeout(r, 20))
-    expect(permOpts[1]!.dataset.on).toBe('true')
+    expect(permissionSelect.value).toBe('read-only')
+    expect(urgencySelect.value).toBe('urgent')
 
     // Find description textarea (SlashPromptInput)
     const textareas = host.querySelectorAll('textarea')
@@ -2066,9 +2254,10 @@ describe('client half', () => {
     await new Promise(r => setTimeout(r, 30))
 
     expect(createdPayloads).toHaveLength(1)
-    const payload = createdPayloads[0] as { title: string; permission?: string; description?: string }
+    const payload = createdPayloads[0] as { title: string; permission?: string; urgency?: string; description?: string }
     expect(payload.title).toBe('Task with read-only permission')
     expect(payload.permission).toBe('read-only')
+    expect(payload.urgency).toBe('urgent')
     expect(payload.description).toBe('使用 /goal 完成任务并按规范交付')
 
     root.unmount()
@@ -2099,5 +2288,181 @@ describe('client half', () => {
       presets: [{ id: 'standard', name: '标准模式' }],
       defaultId: 'standard',
     })
+  })
+
+  it('0.8.0 回归：官方 slot 系统可用时走官方面板注册（不注入 DOM、不设 active 属性、注册 id/key 正确）', async () => {
+    localStorage.clear()
+    const { BoardController } = await import('../src/client/controller.ts')
+    const { mountBoardCompat, OFFICIAL_PANEL_ID } = await import('../src/client/official-panel.tsx')
+    const { injectStyles } = await import('../src/client/styles.ts')
+    injectStyles()
+
+    const client = {
+      state: async () => ({ schemaVersion: 1, revision: 1, tasks: [] }),
+      workspaces: async () => [{ id: 'ws-a', path: '/p/a', title: 'A', sessionCount: 0 }],
+      stream: () => () => {},
+      templates: async () => ({ templates: [] }),
+    }
+    const controller = new BoardController(client as never)
+    controller.start()
+    await new Promise(r => setTimeout(r, 10))
+
+    // Fake official slots service: records registrations, declares the two
+    // slots (spec() non-undefined), mirrors the guardedSlots proxy surface.
+    const registrations: Array<{ slot: string, options: Record<string, unknown> }> = []
+    const injectEffects: Array<() => unknown> = []
+    const slots = {
+      inject: (key: string, callback: () => unknown) => {
+        injectEffects.push(callback)
+        return () => {}
+      },
+      register: (options: Record<string, unknown>) => {
+        registrations.push({ slot: options.name as string, options })
+        return () => {}
+      },
+      spec: (key: string) => (key === 'main' || key === 'sidebar.panellist' ? { kind: 'stub' } : undefined),
+    }
+    const selectPanelCalls: Array<unknown> = []
+    const ctx = {
+      get: (name: string) => name === 'slots' ? slots : name === 'layout' ? { selectPanel: (id: unknown) => { selectPanelCalls.push(id) } } : undefined,
+    }
+
+    const dispose = mountBoardCompat(ctx as never, controller)
+    // The inject() callbacks run synchronously in the real service when the
+    // declaration exists — run them here the same way.
+    for (const run of injectEffects.splice(0)) run()
+
+    // Both official registrations landed with the shared panel id.
+    const main = registrations.find(r => r.slot === 'main')
+    const row = registrations.find(r => r.slot === 'sidebar.panellist')
+    expect(main).toBeDefined()
+    expect(main!.options.key).toBe(OFFICIAL_PANEL_ID)
+    expect(main!.options.key).toBe('dsh-taskboard')
+    expect(row).toBeDefined()
+    expect(row!.options.id).toBe(OFFICIAL_PANEL_ID)
+    expect(typeof row!.options.order).toBe('number')
+    expect(typeof row!.options.label).toBe('function')
+
+    // Official mode injects NO legacy DOM and never sets the hide attribute.
+    expect(document.querySelector('[data-dsh-atb-entry]')).toBeNull()
+    expect(document.querySelector('[data-dsh-atb-view]')).toBeNull()
+    expect(document.documentElement.hasAttribute('data-dsh-atb-active')).toBe(false)
+
+    // Close bridge: closeBoard routes to layout.selectPanel(null) without
+    // setting the legacy hide attribute (the host owns visibility).
+    controller.openBoard()
+    await new Promise(r => setTimeout(r, 10))
+    expect(document.documentElement.hasAttribute('data-dsh-atb-active')).toBe(false)
+    controller.closeBoard()
+    expect(selectPanelCalls).toEqual([null])
+
+    dispose()
+    controller.dispose()
+    localStorage.clear()
+  })
+
+  it('0.8.0 回归：slot 系统缺失时回退 legacy 注入路径', async () => {
+    localStorage.clear()
+    const { BoardController } = await import('../src/client/controller.ts')
+    const { mountBoardCompat } = await import('../src/client/official-panel.tsx')
+    const { BOARD_VIEW_SELECTOR } = await import('../src/client/board-mount.tsx')
+    const { injectStyles } = await import('../src/client/styles.ts')
+    injectStyles()
+
+    const client = {
+      state: async () => ({ schemaVersion: 1, revision: 1, tasks: [] }),
+      workspaces: async () => [{ id: 'ws-a', path: '/p/a', title: 'A', sessionCount: 0 }],
+      stream: () => () => {},
+      templates: async () => ({ templates: [] }),
+    }
+    const controller = new BoardController(client as never)
+    controller.start()
+    await new Promise(r => setTimeout(r, 10))
+
+    // Legacy shell shape (data-pane columns, no slots service on ctx).
+    const column = document.createElement('div')
+    column.dataset.pane = 'sidebar'
+    const logoRow = document.createElement('div')
+    logoRow.className = 'x_logoRow'
+    const newSession = document.createElement('button')
+    newSession.className = 'x_newSession'
+    logoRow.append(newSession)
+    column.append(logoRow)
+    const conversation = document.createElement('div')
+    conversation.dataset.pane = 'conversation'
+    document.body.append(column, conversation)
+
+    // No 'slots' on ctx at all → immediate legacy mounting.
+    const dispose = mountBoardCompat({} as never, controller)
+    await new Promise(r => setTimeout(r, 20))
+
+    expect(document.querySelector('[data-dsh-atb-entry]')).not.toBeNull()
+    const view = document.querySelector<HTMLElement>(BOARD_VIEW_SELECTOR)
+    expect(view).not.toBeNull()
+    expect(view!.parentElement).toBe(conversation)
+
+    // …and the legacy open path still flips the hide attribute (untouched).
+    controller.openBoard()
+    await new Promise(r => setTimeout(r, 10))
+    expect(document.documentElement.hasAttribute('data-dsh-atb-active')).toBe(true)
+    controller.closeBoard()
+
+    dispose()
+    column.remove()
+    conversation.remove()
+    controller.dispose()
+    localStorage.clear()
+  })
+
+  it('0.8.0 回归：官方注册抛错时降级 legacy（不出现双看板）', async () => {
+    localStorage.clear()
+    const { BoardController } = await import('../src/client/controller.ts')
+    const { mountBoardCompat } = await import('../src/client/official-panel.tsx')
+    const { injectStyles } = await import('../src/client/styles.ts')
+    injectStyles()
+
+    const client = {
+      state: async () => ({ schemaVersion: 1, revision: 1, tasks: [] }),
+      workspaces: async () => [{ id: 'ws-a', path: '/p/a', title: 'A', sessionCount: 0 }],
+      stream: () => () => {},
+      templates: async () => ({ templates: [] }),
+    }
+    const controller = new BoardController(client as never)
+    controller.start()
+    await new Promise(r => setTimeout(r, 10))
+
+    const column = document.createElement('div')
+    column.dataset.pane = 'sidebar'
+    const logoRow = document.createElement('div')
+    logoRow.className = 'x_logoRow'
+    const newSession = document.createElement('button')
+    newSession.className = 'x_newSession'
+    logoRow.append(newSession)
+    column.append(logoRow)
+    const conversation = document.createElement('div')
+    conversation.dataset.pane = 'conversation'
+    document.body.append(column, conversation)
+
+    // Slots present and declared, but register() throws mid-flight. The
+    // real service runs an inject() callback synchronously when the slot is
+    // already declared — the fake mirrors that.
+    const slots = {
+      inject: (_key: string, callback: () => unknown) => { void callback(); return () => {} },
+      register: () => { throw new Error('boom') },
+      spec: () => ({ kind: 'stub' }),
+    }
+    const dispose = mountBoardCompat({ get: (name: string) => name === 'slots' ? slots : undefined } as never, controller)
+    await new Promise(r => setTimeout(r, 20))
+
+    // Degraded to legacy: the injected entry exists and exactly ONE board
+    // view (the throwing official path cleaned up before falling back).
+    expect(document.querySelector('[data-dsh-atb-entry]')).not.toBeNull()
+    expect(document.querySelectorAll('[data-dsh-atb-view]')).toHaveLength(1)
+
+    dispose()
+    column.remove()
+    conversation.remove()
+    controller.dispose()
+    localStorage.clear()
   })
 })

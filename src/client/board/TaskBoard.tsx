@@ -11,6 +11,7 @@ import { MAIN_STATUSES, canTransition } from '../../shared/protocol.ts'
 import { PLUGIN_VERSION } from '../../shared/version.ts'
 import { COLUMN_KEYS, URGENCY_KEYS } from './labels.ts'
 import { useT } from '../i18n/runtime.ts'
+import { localizeBuiltinName, localizeBuiltinTask } from '../i18n/templates.ts'
 import { fmtTime, isStaleClaim } from './format.ts'
 import { DRAG_TYPE, TaskCard } from './TaskCard.tsx'
 import { TaskDetail } from './TaskDetail.tsx'
@@ -88,17 +89,21 @@ export function TaskBoard({ controller }: { controller: BoardController }) {
               <div className="dsh-atb-newmenu-backdrop" onClick={closeMenu} />
               <div className="dsh-atb-newmenu-list">
                 <button type="button" className="dsh-atb-newmenu-opt" onClick={() => { closeMenu(); controller.setComposer(true) }}>{t('board.action.blankTask')}</button>
-                {state.templates.map(t => (
-                  <button
-                    key={t.id}
-                    type="button"
-                    className="dsh-atb-newmenu-opt"
-                    title={t.task.description !== undefined && t.task.description.length > 0 ? t.task.description.slice(0, 120) : t.name}
-                    onClick={() => { closeMenu(); controller.newFromTemplate(t.task) }}
-                  >
-                    {t.name}
-                  </button>
-                ))}
+                {state.templates.map(t => {
+                  const name = localizeBuiltinName(t)
+                  const spec = localizeBuiltinTask(t)
+                  return (
+                    <button
+                      key={t.id}
+                      type="button"
+                      className="dsh-atb-newmenu-opt"
+                      title={spec.description !== undefined && spec.description.length > 0 ? spec.description.slice(0, 120) : name}
+                      onClick={() => { closeMenu(); controller.newFromTemplate(spec) }}
+                    >
+                      {name}
+                    </button>
+                  )
+                })}
                 <div className="dsh-atb-newmenu-sep" />
                 <button type="button" className="dsh-atb-newmenu-opt" onClick={() => { closeMenu(); controller.openTemplateManager() }}>{t('board.action.manageTemplates')}</button>
               </div>
@@ -233,6 +238,15 @@ export function TaskBoard({ controller }: { controller: BoardController }) {
                     <span className="dsh-atb-dot" data-status={status} />
                     {t(COLUMN_KEYS[status])}
                     <span className="dsh-atb-colcount">{columnTasks.length}</span>
+                    {status === 'in_progress' && (
+                      <button
+                        type="button"
+                        className="dsh-atb-queuechip"
+                        title={t('queue.panel.title')}
+                        data-bad={(state.queue?.depth ?? 0) > 0 ? 'true' : undefined}
+                        onClick={() => controller.openQueuePanel()}
+                      >{t('board.queue.chip', { n: state.queue?.depth ?? 0 })}</button>
+                    )}
                   </div>
                   <div className="dsh-atb-cards">
                     {columnTasks.map(task => (
@@ -270,6 +284,8 @@ export function TaskBoard({ controller }: { controller: BoardController }) {
 
       {state.diagOpen && <DiagnosticsPanel controller={controller} />}
 
+      {state.queueOpen && <QueuePanel controller={controller} onAlert={showAlert} />}
+
       {state.settingsOpen && <SettingsModal controller={controller} />}
 
       {state.importOpen && <ImportModal controller={controller} />}
@@ -277,6 +293,57 @@ export function TaskBoard({ controller }: { controller: BoardController }) {
       {state.tplManagerOpen && <TemplateManager controller={controller} />}
 
       {alertEl}
+    </div>
+  )
+}
+
+/** 📋 Execution-queue popup (in-progress column chip): depth, oldest wait, and a
+ *  double-confirm "clear queue" that drops every durable queue entry. */
+function QueuePanel({ controller, onAlert }: { controller: BoardController; onAlert: (msg: string) => void }) {
+  const t = useT()
+  const state = controller.getSnapshot()
+  const queue = state.queue
+  const [armed, setArmed] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const depth = queue?.depth ?? 0
+  const wait = queue?.oldestWaitMinutes
+  const clear = async (): Promise<void> => {
+    if (!armed) { setArmed(true); return }
+    setBusy(true)
+    const result = await controller.clearQueue()
+    setBusy(false)
+    setArmed(false)
+    if (result !== undefined) {
+      onAlert(t('queue.cleared', { n: result.cleared }))
+      controller.closeQueuePanel()
+    }
+  }
+  return (
+    <div className="dsh-atb-modal-backdrop" onClick={e => { if (e.target === e.currentTarget) controller.closeQueuePanel() }}>
+      <div className="dsh-atb-modal dsh-atb-queuepanel" role="dialog" aria-modal="true" aria-label={t('queue.panel.title')}>
+        <div className="dsh-atb-modal-head">
+          <span className="dsh-atb-modal-headicon">📋</span>
+          <div className="dsh-atb-modal-headtext">
+            <h3>{t('queue.panel.title')}</h3>
+          </div>
+          <button type="button" className="dsh-atb-modal-close" aria-label={t('shared.close')} onClick={() => controller.closeQueuePanel()}>✕</button>
+        </div>
+        <div className="dsh-atb-modal-body">
+          <div className="dsh-atb-diag-grid">
+            <div className="dsh-atb-diag-item" data-bad={depth > 0 ? 'true' : undefined}><b>{depth}</b><span>{t('queue.depth')}</span></div>
+            <div className="dsh-atb-diag-item" data-bad={wait !== undefined && wait > 5 ? 'true' : undefined}><b>{wait ?? 0}m</b><span>{t('queue.wait')}</span></div>
+          </div>
+          <div className="dsh-atb-queuepanel-actions">
+            <button
+              type="button"
+              className="dsh-atb-btn"
+              disabled={depth === 0 || busy}
+              data-armed={armed ? 'true' : undefined}
+              onClick={() => { void clear() }}
+            >{armed ? t('queue.confirm') : t('queue.clear')}</button>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
@@ -355,15 +422,69 @@ function DiagnosticsPanel({ controller }: { controller: BoardController }) {
 /** Secondary tab: tasks grouped into canceled / archived / trashed columns. */
 function SecondaryTab({ controller, tasks }: { controller: BoardController; tasks: TaskRecord[] }) {
   const t = useT()
+  /** Which column is in card-selection mode ('none' = checkboxes hidden everywhere). */
+  const [selecting, setSelecting] = useState<'none' | 'trashArchived' | 'purgeTrashed'>('none')
+  const [batchBusy, setBatchBusy] = useState(false)
+  const [selected, setSelected] = useState<Set<string>>(() => new Set())
   // Trashed takes precedence (a trashed task still carries its old status,
   // but what matters to the user is the pending purge).
   const trashed = tasks.filter(t => t.trashedAt !== undefined)
   const archived = tasks.filter(t => t.trashedAt === undefined && t.status === 'archived')
   const canceled = tasks.filter(t => t.trashedAt === undefined && t.status === 'canceled')
-  const groups = [
+
+  const toggleSelected = (id: string) => {
+    setSelected(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  /** Select-all toggle for one column: if everything is selected, clear the column; otherwise add all. */
+  const toggleAll = (rows: TaskRecord[]) => {
+    setSelected(prev => {
+      const allSelected = rows.length > 0 && rows.every(r => prev.has(r.id))
+      const next = new Set(prev)
+      for (const r of rows) {
+        if (allSelected) next.delete(r.id)
+        else next.add(r.id)
+      }
+      return next
+    })
+  }
+
+  /** Run a batch action on the selected tasks of the column; failures are skipped one by one. */
+  const runBatch = async (kind: 'trashArchived' | 'purgeTrashed') => {
+    const source = kind === 'trashArchived' ? archived : trashed
+    const targets = source.filter(task => selected.has(task.id))
+    setBatchBusy(true)
+    try {
+      for (const task of targets) {
+        try { await controller.remove(task.id, task.version, kind === 'purgeTrashed') } catch { /* skip stale/conflicting/purge-refused card */ }
+        setSelected(prev => {
+          const next = new Set(prev)
+          next.delete(task.id)
+          return next
+        })
+      }
+    } finally {
+      setBatchBusy(false)
+      setSelecting('none')
+      setSelected(new Set())
+    }
+  }
+
+  /** Exit selection mode and drop the current selection. */
+  const cancelSelecting = () => {
+    setSelecting('none')
+    setSelected(new Set())
+  }
+
+  const groups: { label: string; dot: string; rows: TaskRecord[]; action?: 'trashArchived' | 'purgeTrashed' }[] = [
     { label: t('status.column.canceled'), dot: 'canceled', rows: canceled },
-    { label: t('status.column.archived'), dot: 'archived', rows: archived },
-    { label: t('board.group.trashed'), dot: 'trashed', rows: trashed },
+    { label: t('status.column.archived'), dot: 'archived', rows: archived, action: 'trashArchived' },
+    { label: t('board.group.trashed'), dot: 'trashed', rows: trashed, action: 'purgeTrashed' },
   ]
   if (trashed.length + archived.length + canceled.length === 0) {
     return (
@@ -374,21 +495,78 @@ function SecondaryTab({ controller, tasks }: { controller: BoardController; task
   }
   return (
     <div className="dsh-atb-columns">
-      {groups.map(group => (
+      {groups.map(group => {
+        const selectingThis = selecting === group.action
+        const selectedCount = selectingThis ? group.rows.filter(r => selected.has(r.id)).length : 0
+        const allSelected = group.rows.length > 0 && selectedCount === group.rows.length
+        return (
         <div className="dsh-atb-column" key={group.label}>
           <div className="dsh-atb-colhead">
             <span className="dsh-atb-dot" data-status={group.dot} />
             {group.label}
             <span className="dsh-atb-colcount">{group.rows.length}</span>
+            {group.action && group.rows.length > 0 && (
+              selectingThis ? (
+                <>
+                  <button
+                    type="button"
+                    className="dsh-atb-btn"
+                    disabled={batchBusy}
+                    title={t('board.batch.confirmCancelTip')}
+                    onClick={cancelSelecting}
+                  >{t('board.batch.cancel')}</button>
+                  <button
+                    type="button"
+                    className="dsh-atb-btn"
+                    data-danger="true"
+                    disabled={batchBusy || selectedCount === 0}
+                    title={selectedCount === 0 ? t('board.batch.noneSelected') : t('board.batch.confirmTip')}
+                    onClick={() => { void runBatch(group.action!) }}
+                  >{t('board.batch.confirm')}({selectedCount})</button>
+                  <input
+                    type="checkbox"
+                    className="dsh-atb-selectall"
+                    checked={allSelected}
+                    disabled={batchBusy}
+                    title={t('board.batch.selectAll')}
+                    onClick={e => e.stopPropagation()}
+                    onChange={() => toggleAll(group.rows)}
+                  />
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="dsh-atb-btn"
+                  disabled={batchBusy}
+                  title={group.action === 'trashArchived' ? t('board.batch.trashArchivedTip') : t('board.batch.purgeTrashedTip')}
+                  onClick={() => { setSelecting(group.action!); setSelected(new Set()) }}
+                >{group.action === 'trashArchived' ? t('board.batch.trashArchived') : t('board.batch.purgeTrashed')}</button>
+              )
+            )}
           </div>
           <div className="dsh-atb-cards">
             {group.rows.map(task => (
-              <TaskCard key={task.id} task={task} controller={controller} />
+              group.action && selectingThis ? (
+                <div className="dsh-atb-selrow" key={task.id}>
+                  <input
+                    type="checkbox"
+                    className="dsh-atb-selbox"
+                    checked={selected.has(task.id)}
+                    disabled={batchBusy}
+                    onClick={e => e.stopPropagation()}
+                    onChange={() => toggleSelected(task.id)}
+                  />
+                  <TaskCard task={task} controller={controller} />
+                </div>
+              ) : (
+                <TaskCard key={task.id} task={task} controller={controller} />
+              )
             ))}
             {group.rows.length === 0 && <div className="dsh-atb-empty">{t('board.empty')}</div>}
           </div>
         </div>
-      ))}
+        )
+      })}
     </div>
   )
 }
